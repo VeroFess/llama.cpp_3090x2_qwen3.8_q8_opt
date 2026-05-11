@@ -1005,6 +1005,15 @@ static void dflash_read_tensor(struct ggml_tensor * t, std::vector<float> & dst,
     dflash_read_tensor_to(t, dst.data(), n_floats);
 }
 
+static ggml_backend_t dflash_backend_for_device(const std::vector<ggml_backend_ptr> & backends, ggml_backend_dev_t dev) {
+    for (auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == dev) {
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
 // DFlash eval callback: captures hidden state tensors + tape data during graph execution
 // without modifying the compute graph (zero FP impact on model computation)
 static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -1311,19 +1320,6 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         return;
     }
 
-    // find GPU backend
-    ggml_backend_t gpu_backend = nullptr;
-    for (auto & backend : backends) {
-        auto * dev = ggml_backend_get_device(backend.get());
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            gpu_backend = backend.get();
-            break;
-        }
-    }
-    if (!gpu_backend) {
-        return; // no GPU, fall back to CPU tape via eval callback
-    }
-
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     const int n_rec = (int) rec_ids.size();
@@ -1344,36 +1340,44 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     size_t total_size = 0;
 
     for (int slot = 0; slot < n_slots; ++slot) {
-        // allocate ggml context for this slot's tensor descriptors
-        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
-        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
-        struct ggml_context * tape_ctx = ggml_init(ctx_params);
-
         auto tape = std::make_unique<dflash_tape_gpu>();
         tape->layers.resize(n_rec);
         tape->layer_ids = dflash_capture->recurrent_layer_ids;
         tape->max_tokens = max_tokens;
-        tape->ctx = tape_ctx;
 
         for (int li = 0; li < n_rec; ++li) {
+            const int il = rec_ids[li];
+            ggml_backend_t layer_backend = dflash_backend_for_device(backends, model.dev_layer(il));
+            auto * layer_dev = layer_backend ? ggml_backend_get_device(layer_backend) : nullptr;
+            if (!layer_dev || ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                LLAMA_LOG_WARN("%s: no GPU backend for recurrent layer %d, falling back to CPU tape\n", __func__, il);
+                dflash_capture->tapes.clear();
+                return;
+            }
+
+            size_t ctx_mem = ggml_tensor_overhead() * 4;
+            struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+            struct ggml_context * tape_ctx = ggml_init(ctx_params);
+
             auto & tl = tape->layers[li];
+            tl.ctx = tape_ctx;
+            tl.backend = layer_backend;
             tl.k    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_k, (int64_t)max_tokens);
             tl.v    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_v, (int64_t)max_tokens);
             tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
             tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+
+            tl.buf = ggml_backend_alloc_ctx_tensors(tape_ctx, layer_backend);
+            if (!tl.buf) {
+                LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d layer %d on %s, falling back to CPU tape\n",
+                    __func__, slot, il, ggml_backend_dev_name(layer_dev));
+                dflash_capture->tapes.clear();
+                return;
+            }
+
+            total_size += ggml_backend_buffer_get_size(tl.buf);
         }
 
-        tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
-
-        if (!tape->buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d, falling back to CPU tape\n",
-                __func__, slot);
-            ggml_free(tape_ctx);
-            dflash_capture->tapes.clear();
-            return;
-        }
-
-        total_size += ggml_backend_buffer_get_size(tape->buf);
         dflash_capture->tapes.push_back(std::move(tape));
     }
 
@@ -1454,7 +1458,6 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     }
 
     const uint32_t n_embd_s = hparams.n_embd_s();
-    const uint32_t n_embd_r = hparams.n_embd_r();
 
     // find a GPU backend for graph computation
     ggml_backend_t gpu_backend = nullptr;
@@ -1468,7 +1471,23 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     if (!gpu_backend) {
         tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
         return;
+    }
+
+    bool replay_multi_backend = false;
+    ggml_backend_t replay_first_backend = nullptr;
+    for (int il : rec_ids) {
+        ggml_backend_t layer_backend = dflash_backend_for_device(backends, model.dev_layer(il));
+        if (!layer_backend) {
+            continue;
+        }
+        if (!replay_first_backend) {
+            replay_first_backend = layer_backend;
+        } else if (replay_first_backend != layer_backend) {
+            replay_multi_backend = true;
+            break;
+        }
     }
 
     // GPU tape replay: build a ggml graph with GDN ops for all recurrent layers
@@ -1554,12 +1573,22 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             // GDN op: same kernel as forward pass, bit-identical state update
             ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view);
 
-            // extract state from result (layout: [attn_output | new_state])
-            size_t attn_bytes = (size_t)(S * H_v * n_accepted) * ggml_element_size(result);
-            ggml_tensor * result_state = ggml_view_1d(ctx, result, n_embd_s, attn_bytes);
+            // extract state from result (layout: [attn_output | new_state]).
+            // n_embd_s is the recurrent cell stride; the GDN state payload is S*S*H_v.
+            const int64_t state_elems = S * S * H_v;
+            const size_t state_offset = ggml_row_size(result->type, S * H_v * (int64_t)n_accepted);
+            ggml_tensor * result_state = ggml_view_4d(ctx, result, S, S, H_v, (int64_t)1,
+                ggml_row_size(result->type, S),
+                ggml_row_size(result->type, S * S),
+                ggml_row_size(result->type, state_elems),
+                state_offset);
 
-            // write-back view: points to same location in s_l[il]
-            ggml_tensor * s_write = ggml_view_1d(ctx, s_tensor, n_embd_s, s_byte_offset);
+            // write-back view: points to the GDN state prefix in s_l[il].
+            ggml_tensor * s_write = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
+                ggml_row_size(s_tensor->type, S),
+                ggml_row_size(s_tensor->type, S * S),
+                ggml_row_size(s_tensor->type, state_elems),
+                s_byte_offset);
 
             // copy result state back to recurrent memory (GPU→GPU)
             ggml_tensor * cpy = ggml_cpy(ctx, result_state, s_write);
@@ -1570,6 +1599,238 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
         if (inputs.empty()) {
             ggml_free(ctx);
+            goto conv_rebuild;
+        }
+
+        auto materialize_gpu_tape_to_cpu = [&]() {
+            if (!use_gpu_tape) {
+                return;
+            }
+
+            for (int li = 0; li < n_rec; ++li) {
+                auto & src = gpu_tape->layers[li];
+                auto & dst = tape_layers[li];
+
+                dst.S_k = src.k->ne[0];
+                dst.H_k = src.k->ne[1];
+                dst.S_v = src.v->ne[0];
+                dst.H_v = src.v->ne[1];
+                dst.n_tokens = n_accepted;
+
+                const size_t k_bytes = (size_t) dst.S_k * dst.H_k * n_accepted * sizeof(float);
+                const size_t v_bytes = (size_t) dst.S_v * dst.H_v * n_accepted * sizeof(float);
+                const size_t h_bytes = (size_t) dst.H_v * n_accepted * sizeof(float);
+
+                dst.k.resize(k_bytes / sizeof(float));
+                dst.v.resize(v_bytes / sizeof(float));
+                dst.gate.resize(h_bytes / sizeof(float));
+                dst.beta.resize(h_bytes / sizeof(float));
+
+                ggml_backend_tensor_get(src.k,    dst.k.data(),    0, k_bytes);
+                ggml_backend_tensor_get(src.v,    dst.v.data(),    0, v_bytes);
+                ggml_backend_tensor_get(src.gate, dst.gate.data(), 0, h_bytes);
+                ggml_backend_tensor_get(src.beta, dst.beta.data(), 0, h_bytes);
+            }
+        };
+
+        auto upload_replay_inputs = [&]() {
+            for (auto & inp : inputs) {
+                const int64_t S = inp.q->ne[0];
+                const int64_t H = inp.q->ne[1];
+                size_t q_size = (size_t)(S * H * n_accepted);
+                if (dflash_capture->replay_zeros.size() < q_size) {
+                    dflash_capture->replay_zeros.resize(q_size, 0.0f);
+                }
+                ggml_backend_tensor_set(inp.q, dflash_capture->replay_zeros.data(), 0, ggml_nbytes(inp.q));
+
+                if (!use_gpu_tape) {
+                    auto & tape = tape_layers[inp.tape_li];
+                    const int64_t S   = tape.S_k;
+                    const int64_t H_k = tape.H_k;
+                    const int64_t H_v = tape.H_v;
+
+                    ggml_backend_tensor_set(inp.k, tape.k.data(),    0, S * H_k * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.v, tape.v.data(),    0, S * H_v * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+                }
+            }
+        };
+
+        if (replay_multi_backend) {
+            // The scheduler can exceed GGML_SCHED_MAX_SPLIT_INPUTS when replaying
+            // all recurrent layers across multiple GPUs in one graph. Replay each
+            // layer-local group directly on its owning backend instead.
+            ggml_free(ctx);
+
+            struct replay_group {
+                ggml_backend_t backend = nullptr;
+                ggml_backend_buffer_t buf = nullptr;
+                ggml_context * ctx = nullptr;
+                ggml_cgraph * graph = nullptr;
+                std::vector<replay_input> inputs;
+            };
+
+            std::vector<replay_group> groups;
+            auto free_groups = [&]() {
+                for (auto & group : groups) {
+                    if (group.buf) {
+                        ggml_backend_buffer_free(group.buf);
+                    }
+                    if (group.ctx) {
+                        ggml_free(group.ctx);
+                    }
+                }
+                groups.clear();
+            };
+
+            for (auto & backend_ptr : backends) {
+                ggml_backend_t group_backend = backend_ptr.get();
+                auto * group_dev = ggml_backend_get_device(group_backend);
+                if (!group_dev || ggml_backend_dev_type(group_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+
+                std::vector<int> group_layers;
+                for (int li = 0; li < n_rec; ++li) {
+                    if (dflash_backend_for_device(backends, model.dev_layer(rec_ids[li])) == group_backend) {
+                        group_layers.push_back(li);
+                    }
+                }
+                if (group_layers.empty()) {
+                    continue;
+                }
+
+                size_t group_ctx_mem = ggml_tensor_overhead() * ((size_t) group_layers.size() * 14 + 4) +
+                                       ggml_graph_overhead_custom(group_layers.size() * 12, false);
+                struct ggml_init_params group_ctx_params = { group_ctx_mem, nullptr, true };
+                struct ggml_context * group_ctx = ggml_init(group_ctx_params);
+                struct ggml_cgraph * group_graph = ggml_new_graph_custom(group_ctx, group_layers.size() * 12, false);
+
+                replay_group group;
+                group.backend = group_backend;
+                group.ctx = group_ctx;
+                group.graph = group_graph;
+                group.inputs.reserve(group_layers.size());
+
+                for (int li : group_layers) {
+                    int il = rec_ids[li];
+
+                    int64_t S, H_k, H_v;
+                    if (use_gpu_tape) {
+                        auto & tl = gpu_tape->layers[li];
+                        S   = tl.k->ne[0];
+                        H_k = tl.k->ne[1];
+                        H_v = tl.v->ne[1];
+                    } else {
+                        auto & tape = tape_layers[li];
+                        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+                        S   = tape.S_k;
+                        H_k = tape.H_k;
+                        H_v = tape.H_v;
+                    }
+
+                    ggml_tensor * k_in, * v_in, * g_in, * b_in;
+
+                    if (use_gpu_tape) {
+                        auto & tl = gpu_tape->layers[li];
+                        k_in = ggml_view_4d(group_ctx, tl.k, S, H_k, (int64_t)n_accepted, (int64_t)1,
+                            tl.k->nb[1], tl.k->nb[2], tl.k->nb[2] * n_accepted, 0);
+                        v_in = ggml_view_4d(group_ctx, tl.v, S, H_v, (int64_t)n_accepted, (int64_t)1,
+                            tl.v->nb[1], tl.v->nb[2], tl.v->nb[2] * n_accepted, 0);
+                        g_in = ggml_view_4d(group_ctx, tl.gate, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1,
+                            tl.gate->nb[1], tl.gate->nb[2], tl.gate->nb[2] * n_accepted, 0);
+                        b_in = ggml_view_4d(group_ctx, tl.beta, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1,
+                            tl.beta->nb[1], tl.beta->nb[2], tl.beta->nb[2] * n_accepted, 0);
+                    } else {
+                        k_in = ggml_new_tensor_4d(group_ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
+                        v_in = ggml_new_tensor_4d(group_ctx, GGML_TYPE_F32, S, H_v, (int64_t)n_accepted, (int64_t)1);
+                        g_in = ggml_new_tensor_4d(group_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+                        b_in = ggml_new_tensor_4d(group_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)n_accepted, (int64_t)1);
+                        ggml_set_input(k_in); ggml_set_input(v_in);
+                        ggml_set_input(g_in); ggml_set_input(b_in);
+                    }
+
+                    ggml_tensor * q_in = ggml_new_tensor_4d(group_ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
+                    ggml_set_input(q_in);
+
+                    ggml_tensor * b_sigmoid = ggml_sigmoid(group_ctx, b_in);
+                    ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+                    size_t s_byte_offset = (size_t)cell_idx * n_embd_s * ggml_element_size(s_tensor);
+                    ggml_tensor * s_view = ggml_view_4d(group_ctx, s_tensor, S, S, H_v, (int64_t)1,
+                        S * ggml_element_size(s_tensor),
+                        S * S * ggml_element_size(s_tensor),
+                        S * S * H_v * ggml_element_size(s_tensor),
+                        s_byte_offset);
+
+                    ggml_tensor * result = ggml_gated_delta_net(group_ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view);
+                    const int64_t state_elems = S * S * H_v;
+                    const size_t state_offset = ggml_row_size(result->type, S * H_v * (int64_t)n_accepted);
+                    ggml_tensor * result_state = ggml_view_4d(group_ctx, result, S, S, H_v, (int64_t)1,
+                        ggml_row_size(result->type, S),
+                        ggml_row_size(result->type, S * S),
+                        ggml_row_size(result->type, state_elems),
+                        state_offset);
+                    ggml_tensor * s_write = ggml_view_4d(group_ctx, s_tensor, S, S, H_v, (int64_t)1,
+                        ggml_row_size(s_tensor->type, S),
+                        ggml_row_size(s_tensor->type, S * S),
+                        ggml_row_size(s_tensor->type, state_elems),
+                        s_byte_offset);
+                    ggml_build_forward_expand(group_graph, ggml_cpy(group_ctx, result_state, s_write));
+
+                    group.inputs.push_back({ q_in, k_in, v_in, g_in, b_in, (size_t)li });
+                }
+
+                if (group.inputs.empty()) {
+                    ggml_free(group_ctx);
+                    continue;
+                }
+
+                group.buf = ggml_backend_alloc_ctx_tensors(group_ctx, group_backend);
+                if (!group.buf) {
+                    LLAMA_LOG_WARN("%s: failed to allocate layer-local tape replay graph on %s, falling back to CPU replay\n",
+                        __func__, ggml_backend_dev_name(group_dev));
+                    ggml_free(group_ctx);
+                    free_groups();
+                    materialize_gpu_tape_to_cpu();
+                    tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
+                    goto conv_rebuild;
+                }
+
+                for (auto & inp : group.inputs) {
+                    const int64_t S = inp.q->ne[0];
+                    const int64_t H = inp.q->ne[1];
+                    size_t q_size = (size_t)(S * H * n_accepted);
+                    if (dflash_capture->replay_zeros.size() < q_size) {
+                        dflash_capture->replay_zeros.resize(q_size, 0.0f);
+                    }
+                    ggml_backend_tensor_set(inp.q, dflash_capture->replay_zeros.data(), 0, ggml_nbytes(inp.q));
+
+                    if (!use_gpu_tape) {
+                        auto & tape = tape_layers[inp.tape_li];
+                        const int64_t S   = tape.S_k;
+                        const int64_t H_k = tape.H_k;
+                        const int64_t H_v = tape.H_v;
+
+                        ggml_backend_tensor_set(inp.k, tape.k.data(),    0, S * H_k * n_accepted * sizeof(float));
+                        ggml_backend_tensor_set(inp.v, tape.v.data(),    0, S * H_v * n_accepted * sizeof(float));
+                        ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
+                        ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+                    }
+                }
+
+                groups.push_back(std::move(group));
+            }
+
+            for (auto & group : groups) {
+                enum ggml_status status = ggml_backend_graph_compute(group.backend, group.graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_WARN("%s: layer-local tape replay failed with error %d on %s\n",
+                        __func__, status, ggml_backend_dev_name(ggml_backend_get_device(group.backend)));
+                }
+            }
+
+            free_groups();
             goto conv_rebuild;
         }
 
@@ -1607,32 +1868,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             }
         }
 
-        // upload data for tensors that need it
-        for (auto & inp : inputs) {
-            // Q: always needs zeros
-            {
-                const int64_t S = inp.q->ne[0];
-                const int64_t H = inp.q->ne[1];
-                size_t q_size = (size_t)(S * H * n_accepted);
-                if (dflash_capture->replay_zeros.size() < q_size) {
-                    dflash_capture->replay_zeros.resize(q_size, 0.0f);
-                }
-                ggml_backend_tensor_set(inp.q, dflash_capture->replay_zeros.data(), 0, ggml_nbytes(inp.q));
-            }
-
-            // K, V, gate, beta: only upload from CPU if not using GPU tape
-            if (!use_gpu_tape) {
-                auto & tape = tape_layers[inp.tape_li];
-                const int64_t S   = tape.S_k;
-                const int64_t H_k = tape.H_k;
-                const int64_t H_v = tape.H_v;
-
-                ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
-            }
-        }
+        upload_replay_inputs();
 
         // compute: launch GDN ops + state copies on GPU (async — overlap with next draft)
         ggml_backend_graph_compute_async(gpu_backend, graph);
@@ -3670,6 +3906,21 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
         }
+
+        if (il != -1 &&
+                (strcmp(name, LLAMA_TENSOR_NAME_FGDN_AR) == 0 ||
+                 strcmp(name, LLAMA_TENSOR_NAME_FGDN_CH) == 0 ||
+                 strcmp(name, "fgdn_tree") == 0)) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    if (ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                        break;
+                    }
+                }
+            }
+        }
     };
 }
 
@@ -4632,8 +4883,8 @@ void llama_set_force_split_seq(llama_context * ctx, bool force) {
     }
 }
 
-void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {
-    ctx->allocate_tape_gpu(n_slots, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
+void llama_dflash_allocate_slots(llama_context * ctx, int n_slots, int n_max_tokens) {
+    ctx->allocate_tape_gpu(n_slots, std::max(1, n_max_tokens));
 }
 
 void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {

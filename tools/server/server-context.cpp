@@ -909,7 +909,9 @@ private:
         // Allocate DFlash per-slot tape + hidden buffers now that common_speculative_init
         // (run for slot 0 above) has created dflash_capture on the target context.
         if (dflash_slots_cap > 0) {
-            llama_dflash_allocate_slots(ctx, dflash_slots_cap);
+            const int dflash_tape_max_tokens = std::max<int>(LLAMA_DFLASH_MAX_VERIFY_TOKENS,
+                                                             params_base.speculative.n_max + 1);
+            llama_dflash_allocate_slots(ctx, dflash_slots_cap, dflash_tape_max_tokens);
         }
 
         {

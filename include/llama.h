@@ -1086,11 +1086,12 @@ extern "C" {
     // a verify-only decode, and true after (mixed prompt+TG batches need split_seq).
     LLAMA_API void llama_set_force_split_seq(struct llama_context * ctx, bool force);
 
-    // max verify-batch size (16 draft + a few extra) — sized for DFlash block_size=16.
+    // Minimum per-slot verify tape capacity. llama-server passes draft_max + 1
+    // when DFlash is configured so replay capacity follows runtime settings.
     // MAX_SLOTS caps the batched drafter graph width (must be >= --dflash-max-slots).
     // PER_SLOT_CTX matches common_speculative_state_dflash::ctx_window.
     enum {
-        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25, // must be >= draft_max + 1
+        LLAMA_DFLASH_MAX_VERIFY_TOKENS = 25,
         LLAMA_DFLASH_MAX_SLOTS         = 8,
         LLAMA_DFLASH_PER_SLOT_CTX      = 512,
     };
@@ -1098,7 +1099,7 @@ extern "C" {
     // DFlash: allocate per-slot GPU tape + hidden-capture buffers for multi-slot use.
     // Call before the first llama_decode() (and before set_tape_recording(true)). For
     // single-slot workloads this is optional — a 1-slot allocation is created lazily.
-    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots);
+    LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots, int n_max_tokens);
 
     // DFlash: select which slot's GPU tape the next llama_decode() writes into.
     // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
