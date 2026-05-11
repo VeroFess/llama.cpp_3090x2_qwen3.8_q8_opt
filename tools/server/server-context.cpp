@@ -36,7 +36,7 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
+static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
         pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
     }
@@ -44,21 +44,22 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
         pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
     }
 
-    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    if (on_device) {
+        flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    }
 
-    auto cur = server_prompt_checkpoint {
-        /*.pos_min  = */ pos_min,
-        /*.pos_max  = */ pos_max,
-        /*.n_tokens = */ n_tokens,
-        /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-    };
+    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, flags);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    ckpt.pos_min  = pos_min;
+    ckpt.pos_max  = pos_max;
+    ckpt.n_tokens = n_tokens;
+    ckpt.data.resize(checkpoint_size);
+
+    const size_t n = llama_state_seq_get_data_ext(ctx, ckpt.data.data(), checkpoint_size, id, flags);
     if (n != checkpoint_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
     }
-
-    return cur;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -370,7 +371,12 @@ struct server_slot {
                 if (!spec_draft.empty() && ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                     const auto n_tokens = prompt.tokens.size();
 
-                    spec_ckpt = server_get_checkpoint(ctx, this->id, n_tokens);
+                    //const int64_t t_start = ggml_time_us();
+
+                    server_prompt_checkpoint_update(spec_ckpt, ctx, this->id, n_tokens, true);
+
+                    //const int64_t t_total = ggml_time_us() - t_start;
+                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
 
                     SLT_DBG(*this, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %zu, size = %.3f MiB)\n",
                             spec_ckpt.pos_min, spec_ckpt.pos_max, n_tokens, (float) spec_ckpt.data.size() / 1024 / 1024);
@@ -1447,7 +1453,7 @@ private:
                 return false;
             }
 
-            const bool need_logits = task.params.sampling.n_probs > 0;
+            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             bool backend_sampling = true;
 
@@ -1456,8 +1462,8 @@ private:
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
             backend_sampling &= !(slot.can_speculate() && common_speculative_n_max(slot.spec.get(), task.params.speculative) > 0);
 
-            // TODO: getting post/pre sampling logits is not yet supported with backend sampling
-            backend_sampling &= !need_logits;
+            // TODO: getting pre sampling logits is not yet supported with backend sampling
+            backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
@@ -1634,6 +1640,12 @@ private:
             // set probability for top n_probs tokens
             result.probs.reserve(n_probs);
             for (size_t i = 0; i < n_probs; i++) {
+                // Some samplers do return 0.0 probabilities, others don't.
+                // Filter 0.0 probailities, to ensure the behavior is consistent.
+                if (cur_p->data[i].p == 0.0) {
+                    break;
+                }
+
                 result.probs.push_back({
                     cur_p->data[i].id,
                     common_token_to_piece(ctx, cur_p->data[i].id, special),
@@ -1972,7 +1984,8 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
-        const auto & cur = slot.prompt.checkpoints.emplace_back(server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+        auto & cur = slot.prompt.checkpoints.emplace_back();
+        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, false, pos_min, pos_max);
 
         SLT_WRN(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4337,22 +4350,7 @@ void server_routes::init_routes() {
             }},
             {"object", "list"},
             {"data", {
-                {
-                    {"id",       meta->model_name},
-                    {"aliases",  meta->model_aliases},
-                    {"tags",     meta->model_tags},
-                    {"object",   "model"},
-                    {"created",  std::time(0)},
-                    {"owned_by", "llamacpp"},
-                    {"meta",     {
-                        {"vocab_type",  meta->model_vocab_type},
-                        {"n_vocab",     meta->model_vocab_n_tokens},
-                        {"n_ctx_train", meta->model_n_ctx_train},
-                        {"n_embd",      meta->model_n_embd_inp},
-                        {"n_params",    meta->model_n_params},
-                        {"size",        meta->model_size},
-                    }},
-                },
+                get_model_info(),
             }}
         };
 
@@ -4563,6 +4561,26 @@ void server_routes::init_routes() {
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
+    };
+}
+
+json server_routes::get_model_info() const {
+    return json {
+        {"id",       meta->model_name},
+        {"aliases",  meta->model_aliases},
+        {"tags",     meta->model_tags},
+        {"object",   "model"},
+        {"created",  std::time(0)},
+        {"owned_by", "llamacpp"},
+        {"meta",     {
+            {"vocab_type",  meta->model_vocab_type},
+            {"n_vocab",     meta->model_vocab_n_tokens},
+            {"n_ctx",       meta->slot_n_ctx},
+            {"n_ctx_train", meta->model_n_ctx_train},
+            {"n_embd",      meta->model_n_embd_inp},
+            {"n_params",    meta->model_n_params},
+            {"size",        meta->model_size},
+        }},
     };
 }
 
