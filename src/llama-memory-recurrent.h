@@ -69,6 +69,9 @@ public:
     void copy_cell(int32_t i_src, int32_t i_dst);
     int  get_cell_count(llama_seq_id seq_id) const;
 
+    bool expand(uint32_t new_mem_size);
+    bool shrink(uint32_t new_mem_size);
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -115,6 +118,8 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    bool resize(uint32_t new_mem_size);
 
     size_t total_size() const;
 

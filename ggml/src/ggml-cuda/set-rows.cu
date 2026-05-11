@@ -525,20 +525,44 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 init_tcq_error_dump(ctx.device);
             }
         }
-        // TCQ Viterbi encode: 512 threads per block, global bt buffer (128×512 bytes/block)
+        // TCQ Viterbi encode: 512 threads per block. The TCQ3 backtrace stores
+        // one predecessor for each 64-state low-bit group per step.
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 512);
+            static int tcq3_use_shared_bt[GGML_CUDA_MAX_DEVICES] = {};
+            static bool tcq3_bt_checked[GGML_CUDA_MAX_DEVICES] = {};
+            constexpr int tcq3_bt_shared_bytes = 128 * 64;
+            if (!tcq3_bt_checked[ctx.device]) {
+                tcq3_bt_checked[ctx.device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                const char * tcq_shared_bt_env = getenv("TURBO_TCQ_SHARED_BT");
+                if (!tcq_shared_bt_env || atoi(tcq_shared_bt_env) != 0) {
+                    int max_shared_optin = 0;
+                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
+                    if (max_shared_optin >= tcq3_bt_shared_bytes) {
+                        CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo3_tcq<idx_t>, tcq3_bt_shared_bytes);
+                        tcq3_use_shared_bt[ctx.device] = 1;
+                        fprintf(stderr, "TCQ encode: using shared-memory backtrace (%d bytes/block)\n", tcq3_bt_shared_bytes);
+                    } else {
+                        fprintf(stderr, "TCQ encode: shared-memory backtrace unavailable, only %d bytes/block are available\n", max_shared_optin);
+                    }
+                }
+#endif
+            }
+            if (!tcq3_use_shared_bt[ctx.device]) {
+                ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 64);
+            }
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-            k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, 0, stream>>>(
+            const int shared_bytes = tcq3_use_shared_bt[ctx.device] ? tcq3_bt_shared_bytes : 0;
+            k_set_rows_turbo3_tcq<idx_t><<<(int)ne_total_groups, 512, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo3_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq3_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }
@@ -567,20 +591,41 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
                 init_tcq_error_dump(ctx.device);
             }
         }
-        // 2-bit TCQ Viterbi encode: 256 threads per block, global bt buffer (128×256 bytes/block)
+        // 2-bit TCQ Viterbi encode: 256 threads per block. Compressed backtrace
+        // stores one predecessor per 64 low-state groups per step (same as turbo3_tcq).
         const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
         const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
         const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
         if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
-            ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 256);
+            static int tcq2_use_shared_bt[GGML_CUDA_MAX_DEVICES] = {};
+            static bool tcq2_bt_checked[GGML_CUDA_MAX_DEVICES] = {};
+            constexpr int tcq2_bt_shared_bytes = 128 * 64;
+            if (!tcq2_bt_checked[ctx.device]) {
+                tcq2_bt_checked[ctx.device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                const char * tcq_shared_bt_env = getenv("TURBO_TCQ_SHARED_BT");
+                if (!tcq_shared_bt_env || atoi(tcq_shared_bt_env) != 0) {
+                    int max_shared_optin = 0;
+                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
+                    if (max_shared_optin >= tcq2_bt_shared_bytes) {
+                        CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo2_tcq<idx_t>, tcq2_bt_shared_bytes);
+                        tcq2_use_shared_bt[ctx.device] = 1;
+                    }
+                }
+#endif
+            }
+            if (!tcq2_use_shared_bt[ctx.device]) {
+                ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 64);
+            }
             const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
             const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
             const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
             const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
             const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
-            k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, 0, stream>>>(
+            const int shared_bytes = tcq2_use_shared_bt[ctx.device] ? tcq2_bt_shared_bytes : 0;
+            k_set_rows_turbo2_tcq<idx_t><<<(int)ne_total_groups, 256, shared_bytes, stream>>>(
                 src0_d, src1_d, (block_turbo2_tcq *)dst->data,
-                ne_total_groups, tcq_bt_buf[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq2_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
                 s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
                 ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
         }

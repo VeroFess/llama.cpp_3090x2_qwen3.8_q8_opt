@@ -8,12 +8,12 @@
  */
 
 // API utilities
-export { getAuthHeaders, getJsonHeaders } from './api-headers';
+export { getAuthHeaders, getJsonHeaders, sanitizeHeaders } from './api-headers';
 export { apiFetch, apiFetchWithParams, apiPost, type ApiFetchOptions } from './api-fetch';
 export { validateApiKey } from './api-key-validation';
 
 // Attachment utilities
-export { getAttachmentDisplayItems } from './attachment-display';
+export { getAttachmentDisplayItems, isMcpPrompt, isMcpResource } from './attachment-display';
 export { isTextFile, isImageFile, isPdfFile, isAudioFile } from './attachment-type';
 
 // Textarea utilities
@@ -39,7 +39,10 @@ export { highlightCode, detectIncompleteCodeBlock, type IncompleteCodeBlock } fr
 export { setConfigValue, getConfigValue, configToParameterRecord } from './config-helpers';
 
 // CORS Proxy
-export { buildProxiedUrl, getProxiedUrlString, buildProxiedHeaders } from './cors-proxy';
+export { buildProxiedUrl, buildProxiedHeaders } from './cors-proxy';
+
+// URL utilities
+export { extractRootDomain, sanitizeExternalUrl } from './url';
 
 // Conversation utilities
 export { createMessageCountMap, getMessageCount } from './conversation-utils';
@@ -55,7 +58,7 @@ export {
 
 // File preview utilities
 export { getFileTypeLabel } from './file-preview';
-export { getPreviewText } from './text';
+export { getPreviewText, generateConversationTitle } from './text';
 
 // File type utilities
 export {
@@ -146,9 +149,6 @@ export { createBase64DataUrl } from './data-url';
 // Header utilities
 export { parseHeadersToArray, serializeHeaders } from './headers';
 
-// Favicon utilities
-export { getFaviconUrl } from './favicon';
-
 // Agentic content utilities (structured section derivation)
 export {
 	deriveAgenticSections,
@@ -164,6 +164,20 @@ export { runLegacyMigration, isMigrationNeeded } from './legacy-migration';
 // Cache utilities
 export { TTLCache, ReactiveTTLMap, type TTLCacheOptions } from './cache-ttl';
 
+// Redaction utilities
+export { redactValue } from './redact';
+
+// Request inspection utilities
+export {
+	getRequestUrl,
+	getRequestMethod,
+	getRequestBody,
+	summarizeRequestBody,
+	formatDiagnosticErrorMessage,
+	extractJsonRpcMethods,
+	type RequestBodySummary
+} from './request-helpers';
+
 // Abort signal utilities
 export {
 	throwIfAborted,
@@ -176,3 +190,6 @@ export {
 // Cryptography utilities
 
 export { uuid } from './uuid';
+
+// CSS utilities
+export { remToPx } from './css';

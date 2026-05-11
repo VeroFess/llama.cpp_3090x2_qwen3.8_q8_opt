@@ -4,6 +4,9 @@
 // ~128 VGPR/lane and spills on this kernel. 1 block/SM raises the per-lane
 // VGPR budget to ~256 and eliminates the spill entirely. CUDA keeps 2.
 // See llama.cpp issue #20354 (GATED_DELTA_NET HIP underperforms on RDNA3).
+// exp2 is a single SFU instruction (ex2.approx) vs expf's multiply + ex2 + range reduction
+#define GDN_EXPF(x) exp2f((x) * 1.442695041f)
+
 #if defined(GGML_USE_HIP)
 #define GGML_GDN_MIN_BLOCKS_PER_SM 1
 #else
@@ -86,7 +89,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = GDN_EXPF(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -119,7 +122,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += GDN_EXPF(g_t[i]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -133,7 +136,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = GDN_EXPF(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -394,7 +397,7 @@ gated_delta_net_tree_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = GDN_EXPF(*g_t);
 
             float kv_shard = 0.0f;
 #pragma unroll
@@ -422,7 +425,7 @@ gated_delta_net_tree_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += GDN_EXPF(g_t[i]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -433,7 +436,7 @@ gated_delta_net_tree_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = GDN_EXPF(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 

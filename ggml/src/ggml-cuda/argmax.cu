@@ -424,7 +424,7 @@ void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (K <= 0) K = 1;
 
     const float inv_temp = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
-    const bool output_logprob = (temp > 0.0f) || (K > 1); // always output log-probs for top-K (DDTree needs them)
+    const bool output_logprob = true; // always output log-probs (needed for p_min early stopping + DDTree)
 
     const int64_t num_blocks = nrows;
     const int64_t num_threads = std::min<int64_t>(1024, (ne00 + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);

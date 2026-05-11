@@ -12,6 +12,7 @@
 // expected by the drafter's target_hidden tensor, avoiding the CPU round-trip.
 
 struct dflash_cross_ring_gpu {
+    int device;               // CUDA device where ring buffers are allocated
     int n_layers;
     int n_embd;
     int ring_size;
@@ -54,6 +55,7 @@ extern "C" void * dflash_cross_ring_gpu_alloc(int n_layers, int n_embd, int ring
     }
 
     auto * ring = new dflash_cross_ring_gpu();
+    cudaGetDevice(&ring->device);
     ring->n_layers  = n_layers;
     ring->n_embd    = n_embd;
     ring->ring_size = ring_size;
@@ -123,6 +125,10 @@ extern "C" void dflash_cross_ring_gpu_write(
     if (layer < 0 || layer >= ring->n_layers) return;
     if (n_tokens <= 0) return;
 
+    // Ensure cudaStreamPerThread belongs to the ring's device regardless of
+    // which GPU the caller (target model decode) last set as current.
+    (void)cudaSetDevice(ring->device);
+
     float * dst = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
 
@@ -149,6 +155,8 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
 
     int cross_len = filled < ctx_window ? filled : ctx_window;
     if (cross_len <= 0) return nullptr;
+
+    (void)cudaSetDevice(ring->device);
 
     int read_start = ((write_pos - cross_len) % ring->ring_size + ring->ring_size) % ring->ring_size;
 

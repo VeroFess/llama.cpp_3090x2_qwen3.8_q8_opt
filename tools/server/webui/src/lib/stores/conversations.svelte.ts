@@ -23,9 +23,14 @@ import { browser } from '$app/environment';
 import { toast } from 'svelte-sonner';
 import { DatabaseService } from '$lib/services/database.service';
 import { config } from '$lib/stores/settings.svelte';
-import { filterByLeafNodeId, findLeafNode, runLegacyMigration } from '$lib/utils';
+import {
+	filterByLeafNodeId,
+	findLeafNode,
+	runLegacyMigration,
+	generateConversationTitle
+} from '$lib/utils';
 import type { McpServerOverride } from '$lib/types/database';
-import { MessageRole } from '$lib/enums';
+import { MessageRole, HtmlInputType, FileExtensionText } from '$lib/enums';
 import {
 	ISO_DATE_TIME_SEPARATOR,
 	ISO_DATE_TIME_SEPARATOR_REPLACEMENT,
@@ -39,6 +44,8 @@ import {
 	MULTIPLE_UNDERSCORE_REGEX,
 	MCP_DEFAULT_ENABLED_LOCALSTORAGE_KEY
 } from '$lib/constants';
+import { ROUTES } from '$lib/constants/routes';
+import { RouterService } from '$lib/services/router.service';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 export interface ConversationTreeItem {
@@ -255,7 +262,7 @@ class ConversationsStore {
 		this.activeConversation = conversation;
 		this.activeMessages = [];
 
-		await goto(`#/chat/${conversation.id}`);
+		await goto(RouterService.chat(conversation.id));
 
 		return conversation.id;
 	}
@@ -331,7 +338,7 @@ class ConversationsStore {
 
 				if (this.activeConversation && idsToRemove.has(this.activeConversation.id)) {
 					this.clearActiveConversation();
-					await goto(`?new_chat=true#/`);
+					await goto(ROUTES.NEW_CHAT);
 				}
 			} else {
 				// Reparent direct children to deleted conv's parent (or promote to top-level)
@@ -347,7 +354,7 @@ class ConversationsStore {
 
 				if (this.activeConversation?.id === convId) {
 					this.clearActiveConversation();
-					await goto(`?new_chat=true#/`);
+					await goto(ROUTES.NEW_CHAT);
 				}
 			}
 		} catch (error) {
@@ -371,7 +378,7 @@ class ConversationsStore {
 
 			toast.success('All conversations deleted');
 
-			await goto(`?new_chat=true#/`);
+			await goto(ROUTES.NEW_CHAT);
 		} catch (error) {
 			console.error('Failed to delete all conversations:', error);
 			toast.error('Failed to delete conversations');
@@ -548,7 +555,10 @@ class ConversationsStore {
 			) {
 				await this.updateConversationTitleWithConfirmation(
 					this.activeConversation.id,
-					newFirstUserMessage.content.trim()
+					generateConversationTitle(
+						newFirstUserMessage.content,
+						Boolean(config().titleGenerationUseFirstLine)
+					)
 				);
 			}
 		}
@@ -721,7 +731,7 @@ class ConversationsStore {
 
 			this.conversations = [newConv, ...this.conversations];
 
-			await goto(`#/chat/${newConv.id}`);
+			await goto(RouterService.chat(newConv.id));
 
 			toast.success('Conversation forked');
 
@@ -789,7 +799,15 @@ class ConversationsStore {
 			return;
 		}
 
-		const downloadFilename = filename ?? this.generateConversationFilename(conversation, msgs);
+		let downloadFilename: string;
+
+		if (filename) {
+			downloadFilename = filename;
+		} else if (Array.isArray(data) && data.length > 1) {
+			downloadFilename = `${new Date().toISOString().split(ISO_DATE_TIME_SEPARATOR)[0]}_conversations.json`;
+		} else {
+			downloadFilename = this.generateConversationFilename(conversation, msgs);
+		}
 
 		const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
 		const url = URL.createObjectURL(blob);
@@ -830,8 +848,8 @@ class ConversationsStore {
 	async importConversations(): Promise<DatabaseConversation[]> {
 		return new Promise((resolve, reject) => {
 			const input = document.createElement('input');
-			input.type = 'file';
-			input.accept = '.json';
+			input.type = HtmlInputType.FILE;
+			input.accept = FileExtensionText.JSON;
 
 			input.onchange = async (e) => {
 				const file = (e.target as HTMLInputElement)?.files?.[0];

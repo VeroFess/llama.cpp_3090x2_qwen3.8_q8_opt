@@ -105,5 +105,14 @@ common_speculative_tree common_speculative_draft_tree(
                             llama_token   id_last,
                                     int   tree_budget);
 
+int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
+int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+struct common_speculative_deleter {
+    void operator()(common_speculative * s) { common_speculative_free(s); }
+};
+
+typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
