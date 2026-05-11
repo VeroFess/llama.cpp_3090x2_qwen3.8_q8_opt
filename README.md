@@ -4,9 +4,113 @@
 
 > **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) focused on long-context NVIDIA serving:
+
+- **TurboQuant / TCQ KV cache types** for compressed KV cache (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`).
+- **Fused MTP speculative decoding** for Qwen-style MTP GGUF models.
+- **Split-GPU serving fixes** for DFlash / tape replay and multi-card deployments.
+- Validated full-slot `262144` context serving for `Qwen36Q4NoThink` on dual RTX 3090 cards.
+
+The TCQ path provides 2-3x more context in the same VRAM, with quality that matches or beats FP16.
 
 **Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
+
+## What this fork adds
+
+This repository currently carries these fork-specific changes on top of upstream llama.cpp:
+
+| Area | What changed |
+|------|--------------|
+| TurboQuant KV cache | Adds compressed CUDA KV cache types, including scalar turbo and TCQ variants. |
+| MTP speculative decoding | Adds `--spec-type mtp` support for fused MTP GGUF files. The MTP GGUF is passed as the main `--model`; do not also pass it as `--model-draft`. |
+| Qwen MTP model loading | Adds Qwen MTP architecture handling and partial MTP-head loading from the same GGUF. |
+| Multi-GPU serving | Fixes DFlash tape replay behavior for split-GPU models and validates `--split-mode layer` with explicit tensor split. |
+| Long-context deployment | Adds tested presets for Qwen36Q4NoThink at an effective `262144` token slot context. |
+
+## Code provenance
+
+This fork uses and adapts code from:
+
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp): upstream base project.
+- [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp): TurboQuant / TCQ KV cache work and CUDA KV compression assets.
+- [am17an's MTP support work for llama.cpp, PR #22673](https://github.com/ggml-org/llama.cpp/pull/22673): MTP speculative decoding design and Qwen MTP model support, adapted into this fork.
+
+Local fork changes additionally include the split-GPU DFlash/tape replay fixes and deployment presets used for our dual-3090 server.
+
+## Best known Qwen36Q4NoThink MTP configuration
+
+For `Qwen36Q4NoThink`, the best default we have tested is fused MTP with `turbo4` KV cache, layer split, and `spec-draft-n-max = 2`.
+
+Use the MTP GGUF as the main model:
+
+```sh
+./build/bin/llama-server \
+  --model /path/to/Qwen36Q4NoThink-MTP.gguf \
+  --n-gpu-layers 999 \
+  --flash-attn on \
+  --parallel 1 \
+  --ctx-size 524288 \
+  --fit off \
+  --batch-size 1024 \
+  --ubatch-size 512 \
+  --split-mode layer \
+  --tensor-split 0.50,0.50 \
+  --main-gpu 0 \
+  --cache-type-k turbo4 \
+  --cache-type-v turbo4 \
+  --kv-offload \
+  --no-kv-unified \
+  --spec-type mtp \
+  --spec-draft-n-max 2 \
+  --spec-draft-n-min 0
+```
+
+Recommended serving preset:
+
+```ini
+[Qwen36Q4NoThink]
+alias = qwen3.6-q4-nothink,Qwen36Q4NoThink
+model = /opt/models/mtp/Qwen36Q4NoThink-MTP-havenoammo-Q4_K_P.gguf
+temperature = 0.78
+top-p = 0.90
+top-k = 20
+min-p = 0.02
+presence-penalty = 0.35
+repeat-penalty = 1.05
+repeat-last-n = 512
+reasoning = off
+reasoning-budget = 0
+ctx-size = 524288
+fit = off
+cache-type-k = turbo4
+cache-type-v = turbo4
+batch-size = 1024
+ubatch-size = 512
+split-mode = layer
+tensor-split = 0.50,0.50
+main-gpu = 0
+spec-type = mtp
+spec-draft-n-max = 2
+spec-draft-n-min = 0
+```
+
+Notes:
+
+- `ctx-size = 524288` is intentional for this MTP server path; the loaded slot reports an effective `n_ctx = 262144`.
+- `fit = off` prevents the server from silently reducing the requested context.
+- Do not configure `model-draft`, `cache-type-k-draft`, or `cache-type-v-draft` for fused MTP. Those options are for separate draft-model speculative decoding, not the fused MTP GGUF path.
+
+Measured on a dual RTX 3090 host with `Qwen36Q4NoThink-MTP-havenoammo-Q4_K_P.gguf` and an effective `262144` token slot context:
+
+| Config | Short Chinese decode | ~2005-token Chinese prompt decode | ~2005-token prompt prefill | GPU memory |
+|--------|----------------------|-----------------------------------|----------------------------|------------|
+| `turbo4`, `n-max=2`, layer 50/50, `ubatch=512` | 25.3 tok/s | 42.1 tok/s | 762.9 tok/s | 14.9G / 20.0G |
+| `turbo4`, `n-max=3`, layer 50/50, `ubatch=512` | 23.4 tok/s | 43.2 tok/s | 754.6 tok/s | 15.0G / 20.1G |
+| `turbo4`, `n-max=3`, tensor split 60/40 | 22.9 tok/s | 39.9 tok/s | 637.1 tok/s | 17.8G / 17.4G |
+| `turbo4`, `n-max=3`, `ubatch=256` | 23.6 tok/s | 42.5 tok/s | 718.3 tok/s | 13.8G / 18.0G |
+| `turbo4`, `n-max=3`, row split | 21.0 tok/s | 33.2 tok/s | 333.5 tok/s | 15.9G / 16.1G |
+
+For a mixed workload, `spec-draft-n-max = 2` is the recommended default. `spec-draft-n-max = 3` can slightly improve long Chinese decode throughput, but it is slower for short prompts and uses a little more VRAM.
 
 ## What is TCQ?
 
