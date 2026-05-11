@@ -2576,7 +2576,8 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * state,
+            bool                  keep_intermediates);
 
     // Tree-mode gated delta net: processes tokens with tree structure via parent_ids
     // persist_inter: [S_v, S_v, H, n_tokens, n_seqs] f16 buffer for intermediate states
