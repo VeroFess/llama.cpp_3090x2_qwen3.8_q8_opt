@@ -21,9 +21,11 @@ GGML_CUDA_P2P=1 \
 GGML_CUDA_ALLREDUCE=nccl \
 ./build-qwen38-3090/bin/llama-server \
   --model /models/Qwen3.8-27B-Q8_0.gguf \
+  --alias Qwen3.8-27B-Q8_0 \
   --profile qwen38-27b-q8-2x3090 \
   --split-mode tensor \
   --ubatch-size 1024 \
+  --reasoning off \
   --host 0.0.0.0 \
   --port 8080 \
   --metrics
