@@ -312,6 +312,11 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,
+    GGML_TYPE_TURBO4_0,
+    GGML_TYPE_TURBO3_TCQ,
+    GGML_TYPE_TURBO2_TCQ,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2529,6 +2534,93 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
+        add_opt(common_arg(
+            {"--profile"}, "NAME",
+            "deployment profile",
+            [](common_params & params, const std::string & value) {
+                params.deployment_profile = value;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--max-model-len"}, "N",
+            "maximum input plus output tokens for one sequence",
+            [](common_params & params, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("max-model-len must be positive");
+                }
+                params.n_ctx = value;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--max-num-seqs"}, "N",
+            "maximum number of resident sequences",
+            [](common_params & params, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("max-num-seqs must be positive");
+                }
+                params.n_parallel = value;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--max-num-batched-tokens"}, "N|auto",
+            "scheduler token budget per iteration",
+            [](common_params & params, const std::string & value) {
+                params.max_num_batched_tokens = value == "auto" ? 0 : std::stoi(value);
+                if (params.max_num_batched_tokens < 0) {
+                    throw std::invalid_argument("max-num-batched-tokens must be positive or auto");
+                }
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--gpu-memory-reserve-mib"}, "N|auto",
+            "reserved device memory in MiB",
+            [](common_params & params, const std::string & value) {
+                params.gpu_memory_reserve_mib = value == "auto" ? 0 : std::stoi(value);
+                if (params.gpu_memory_reserve_mib < 0) {
+                    throw std::invalid_argument("gpu-memory-reserve-mib must be positive or auto");
+                }
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--kv-page-size"}, "16|32|auto",
+            "logical KV page size in tokens",
+            [](common_params & params, const std::string & value) {
+                params.kv_page_size = value == "auto" ? 0 : std::stoi(value);
+                if (params.kv_page_size != 0 && params.kv_page_size != 16 && params.kv_page_size != 32) {
+                    throw std::invalid_argument("kv-page-size must be 16, 32, or auto");
+                }
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--scheduler-target-step-ms"}, "N|auto",
+            "scheduler target step time in milliseconds",
+            [](common_params & params, const std::string & value) {
+                params.scheduler_target_step_ms = value == "auto" ? 0.0f : std::stof(value);
+                if (params.scheduler_target_step_ms < 0.0f) {
+                    throw std::invalid_argument("scheduler-target-step-ms must be positive or auto");
+                }
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--autotune"}, "off|quick",
+            "validate a cached target tuning profile",
+            [](common_params & params, const std::string & value) {
+                if (value != "off" && value != "quick") {
+                    throw std::invalid_argument("autotune must be off or quick");
+                }
+                params.autotune_mode = value;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--autotune-cache"}, "PATH",
+            "target tuning cache used by --autotune quick",
+            [](common_params & params, const std::string & value) {
+                if (value.empty()) {
+                    throw std::invalid_argument("autotune-cache path must not be empty");
+                }
+                params.autotune_cache_path = value;
+            }
+        ).set_examples({LLAMA_EXAMPLE_SERVER}));
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

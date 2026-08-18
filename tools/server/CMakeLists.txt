@@ -7,6 +7,8 @@ set(TARGET server-context)
 add_library(${TARGET} STATIC
     server-chat.cpp
     server-chat.h
+    server-continuous-scheduler.cpp
+    server-continuous-scheduler.h
     server-task.cpp
     server-task.h
     server-queue.cpp
@@ -23,6 +25,10 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-qwen38-profile.cpp
+    server-qwen38-profile.h
+    server-prefix-cache-index.cpp
+    server-prefix-cache-index.h
 )
 
 if (BUILD_SHARED_LIBS)
@@ -32,6 +38,10 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+if (GGML_QWEN38_2X3090)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(${TARGET} PUBLIC OpenSSL::Crypto)
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

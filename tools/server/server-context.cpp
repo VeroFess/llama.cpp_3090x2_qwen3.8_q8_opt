@@ -1,11 +1,13 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-continuous-scheduler.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-qwen38-profile.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -18,13 +20,17 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -221,6 +227,7 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    int64_t t_task_started = 0;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -252,12 +259,33 @@ struct server_slot {
 
     server_prompt prompt;
 
+    std::string prompt_cache_fingerprint() const {
+        std::string result;
+        for (const auto & adapter : lora) {
+            if (adapter.scale == 0.0f) {
+                continue;
+            }
+            result += string_format("%zu:%s:%a;", adapter.path.size(), adapter.path.c_str(), adapter.scale);
+        }
+        return result;
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        llama_paged_memory_stats paged_stats;
+        const bool paged = llama_memory_paged_get_stats(mem_tgt, &paged_stats);
+        uint64_t paged_prefix_id = 0;
+        if (paged && !llama_memory_paged_prefix_pin(mem_tgt, id, prompt.tokens.size(), &paged_prefix_id)) {
+            SLT_WRN(*this, "%s", "failed to pin resident prompt prefix\n");
+            return false;
+        }
+
+        const llama_state_seq_flags flags_tgt = paged ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, flags_tgt);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
@@ -265,12 +293,12 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, prompt_cache_fingerprint(), paged_prefix_id);
         if (cur == nullptr) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, flags_tgt);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
@@ -279,7 +307,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, prompt_cache_fingerprint());
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -302,6 +330,7 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+    bool backend_sampling_active = false;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -310,6 +339,9 @@ struct server_slot {
     std::vector<float> inp_embd;
 
     server_slot_stats stats;
+
+    llama_graph_stats graph_decode_start_tgt{};
+    llama_graph_stats graph_decode_start_dft{};
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -354,6 +386,7 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        backend_sampling_active = false;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -818,6 +851,19 @@ public:
         }
     }
 
+    llama_paged_memory_stats qwen38_page_stats() const {
+        llama_paged_memory_stats stats{};
+        llama_memory_paged_get_stats(llama_get_memory(ctx_tgt), &stats);
+        return stats;
+    }
+
+    std::pair<int64_t, int32_t> qwen38_watchdog_status() const {
+        return {
+            watchdog_timeout_us / 1000,
+            watchdog_stage.load(std::memory_order_relaxed),
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -857,8 +903,12 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_continuous_scheduler> continuous_scheduler;
 
     server_metrics metrics;
+    llama_pipeline_transfer_stats pipeline_target_baseline = {};
+    llama_pipeline_transfer_stats pipeline_draft_baseline = {};
+    int64_t pipeline_observation_start_us = 0;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
     // note: kept out of server_metrics, which is copied as-is into the task result
@@ -879,7 +929,79 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    std::atomic<bool> watchdog_stop {true};
+    std::atomic<int64_t> watchdog_deadline_us {0};
+    std::atomic<int32_t> watchdog_stage {0};
+    std::atomic<int32_t> watchdog_batch_tokens {0};
+    std::thread watchdog_thread;
+    int64_t watchdog_timeout_us = 120000000;
+
+    void stop_watchdog() {
+        watchdog_stop.store(true, std::memory_order_release);
+        watchdog_deadline_us.store(0, std::memory_order_release);
+        if (watchdog_thread.joinable()) {
+            watchdog_thread.join();
+        }
+    }
+
+    void start_watchdog() {
+        stop_watchdog();
+        if (!server_qwen38_profile_enabled(params_base)) {
+            return;
+        }
+        if (const char * value = std::getenv("LLAMA_CUDA_WATCHDOG_MS")) {
+            watchdog_timeout_us = std::max<int64_t>(30000000, std::atoll(value) * 1000);
+        }
+        watchdog_stop.store(false, std::memory_order_release);
+        watchdog_thread = std::thread([this]() {
+            while (!watchdog_stop.load(std::memory_order_acquire)) {
+                const int64_t deadline = watchdog_deadline_us.load(std::memory_order_acquire);
+                if (deadline > 0 && ggml_time_us() > deadline) {
+                    SRV_ERR("CUDA watchdog timeout: stage=%d, batch_tokens=%d, timeout_ms=%" PRId64 "\n",
+                        watchdog_stage.load(std::memory_order_relaxed),
+                        watchdog_batch_tokens.load(std::memory_order_relaxed),
+                        watchdog_timeout_us / 1000);
+                    common_log_flush(common_log_main());
+                    std::_Exit(70);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        });
+    }
+
+    void arm_watchdog(int32_t stage, int32_t batch_tokens) {
+        if (!watchdog_thread.joinable()) {
+            return;
+        }
+        watchdog_stage.store(stage, std::memory_order_relaxed);
+        watchdog_batch_tokens.store(batch_tokens, std::memory_order_relaxed);
+        watchdog_deadline_us.store(ggml_time_us() + watchdog_timeout_us, std::memory_order_release);
+    }
+
+    void disarm_watchdog() {
+        watchdog_deadline_us.store(0, std::memory_order_release);
+        watchdog_stage.store(0, std::memory_order_relaxed);
+        watchdog_batch_tokens.store(0, std::memory_order_relaxed);
+    }
+
+    void reset_pipeline_observation(bool synchronize) {
+        if (synchronize) {
+            llama_synchronize(ctx_tgt);
+            if (ctx_dft != nullptr) {
+                llama_synchronize(ctx_dft);
+            }
+            pipeline_target_baseline = llama_get_pipeline_transfer_stats(ctx_tgt);
+            pipeline_draft_baseline = llama_get_pipeline_transfer_stats(ctx_dft);
+        }
+        llama_reset_pipeline_timeline(ctx_tgt);
+        pipeline_observation_start_us = ggml_time_us();
+    }
+
     void destroy() {
+        stop_watchdog();
+        prompt_cache.reset();
+        continuous_scheduler.reset();
+
         spec.reset();
         spec_init.reset();
 
@@ -1105,6 +1227,14 @@ private:
             return false;
         }
 
+        {
+            std::string error;
+            if (!server_qwen38_profile_validate_model(params_base, model_tgt, ctx_tgt, error)) {
+                SRV_ERR("profile model error: %s\n", error.c_str());
+                return false;
+            }
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -1205,6 +1335,21 @@ private:
 
         slots.clear();
 
+        if (server_qwen38_profile_enabled(params_base)) {
+            continuous_scheduler = std::make_unique<server_continuous_scheduler>(server_continuous_scheduler::config {
+                static_cast<size_t>(params_base.max_num_batched_tokens),
+                static_cast<size_t>(std::max(1, params_base.kv_page_size)),
+                static_cast<size_t>(params_base.max_num_batched_tokens),
+                static_cast<size_t>(std::max(1, params_base.kv_page_size)),
+                static_cast<uint64_t>(params_base.scheduler_target_step_ms * 1000.0f),
+                static_cast<uint64_t>(params_base.scheduler_target_step_ms * 8000.0f),
+                5000000,
+                static_cast<size_t>(params_base.max_num_batched_tokens),
+            });
+        } else {
+            continuous_scheduler.reset();
+        }
+
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
@@ -1260,6 +1405,7 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                llama_memory_paged_release_admission(llama_get_memory(ctx_tgt), id_slot);
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1307,7 +1453,7 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, llama_get_memory(ctx_tgt), std::max<size_t>(1, params_base.kv_page_size));
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1338,8 +1484,16 @@ private:
         params = params_base;
 
         if (!is_resume) {
-            return init();
+            const bool initialized = init();
+            if (initialized) {
+                reset_pipeline_observation(true);
+                start_watchdog();
+            }
+            return initialized;
         }
+
+        reset_pipeline_observation(true);
+        start_watchdog();
 
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
@@ -1715,13 +1869,29 @@ private:
             return false;
         }
 
+        if (server_qwen38_profile_enabled(params_base)) {
+            const size_t prompt_tokens = task.tokens.size();
+            const int32_t configured_predict = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+            const size_t max_output_tokens = configured_predict < 0 ? params_base.n_ctx - std::min<size_t>(prompt_tokens, params_base.n_ctx) : static_cast<size_t>(configured_predict);
+            if (prompt_tokens > static_cast<size_t>(params_base.n_ctx) || max_output_tokens > static_cast<size_t>(params_base.n_ctx) - prompt_tokens) {
+                send_error(task.id, "input plus maximum output exceeds max-model-len", ERROR_TYPE_EXCEED_CONTEXT_SIZE, task.n_tokens(), params_base.n_ctx);
+                return false;
+            }
+            if (!llama_memory_paged_admit(llama_get_memory(ctx_tgt), slot.id, prompt_tokens + max_output_tokens)) {
+                send_error(task, "resident token page pool is full", ERROR_TYPE_UNAVAILABLE);
+                return false;
+            }
+        }
+
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         // initialize samplers
         if (task.need_sampling()) {
+            const bool backend_sampling_requested = task.params.sampling.backend_sampling;
             try {
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
+                llama_memory_paged_release_admission(llama_get_memory(ctx_tgt), slot.id);
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
                 return false;
@@ -1733,6 +1903,7 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
+            task.params.sampling.backend_sampling = use_backend_sampling;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
@@ -1740,17 +1911,23 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            slot.backend_sampling_active = use_backend_sampling;
+            if (backend_sampling_requested && !use_backend_sampling) {
+                ++metrics.gpu_sampling_fallbacks;
+            }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
         } else {
             slot.smpl.reset();
+            slot.backend_sampling_active = false;
         }
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.t_task_started = ggml_time_us();
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2441,10 +2618,75 @@ private:
                     res->n_idle_slots        = n_idle_slots;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    if (prompt_cache) {
+                        metrics.kv_prefix_hit_tokens = prompt_cache->prefix_hit_tokens;
+                        metrics.kv_prefix_miss_tokens = prompt_cache->prefix_miss_tokens;
+                        metrics.kv_prefix_evictions = prompt_cache->prefix_evictions;
+                    }
+                    if (continuous_scheduler) {
+                        metrics.scheduler_prefill_us_per_token = continuous_scheduler->prefill_us_per_token();
+                        metrics.scheduler_decode_us_per_token = continuous_scheduler->decode_us_per_token();
+                    }
+                    {
+                        const auto target = llama_get_graph_stats(ctx_tgt);
+                        const auto draft = llama_get_graph_stats(ctx_dft);
+                        metrics.cuda_graph_target = target;
+                        metrics.cuda_graph_draft = draft;
+                        metrics.cuda_graph_hits = target.hits + draft.hits;
+                        metrics.cuda_graph_misses = target.misses + draft.misses;
+                        metrics.cuda_graph_captures = target.captures + draft.captures;
+                        metrics.cuda_graph_fallbacks = target.fallbacks + draft.fallbacks;
+                        metrics.cuda_graph_cache_entries = target.cache_entries + draft.cache_entries;
+                        metrics.cuda_graph_capture_us = target.capture_us + draft.capture_us;
+                        const auto target_transfer = llama_get_output_transfer_stats(ctx_tgt);
+                        const auto draft_transfer = llama_get_output_transfer_stats(ctx_dft);
+                        metrics.gpu_raw_logits_d2h_bytes = target_transfer.raw_logits_bytes + draft_transfer.raw_logits_bytes;
+                        metrics.gpu_sampled_output_d2h_bytes = target_transfer.sampled_output_bytes + draft_transfer.sampled_output_bytes;
+                        const auto draft_pipeline = llama_get_pipeline_transfer_stats(ctx_dft);
+                        const auto target_pipeline = llama_get_pipeline_transfer_stats(ctx_tgt);
+                        const auto delta = [](uint64_t value, uint64_t baseline) {
+                            return value >= baseline ? value - baseline : 0;
+                        };
+                        metrics.pipeline_host_staged_transfers = delta(target_pipeline.host_staged_transfers, pipeline_target_baseline.host_staged_transfers) +
+                            delta(draft_pipeline.host_staged_transfers, pipeline_draft_baseline.host_staged_transfers);
+                        metrics.pipeline_d2h_bytes = delta(target_pipeline.d2h_bytes, pipeline_target_baseline.d2h_bytes) +
+                            delta(draft_pipeline.d2h_bytes, pipeline_draft_baseline.d2h_bytes);
+                        metrics.pipeline_h2d_bytes = delta(target_pipeline.h2d_bytes, pipeline_target_baseline.h2d_bytes) +
+                            delta(draft_pipeline.h2d_bytes, pipeline_draft_baseline.h2d_bytes);
+                        metrics.pipeline_direct_peer_transfers = delta(target_pipeline.direct_peer_transfers, pipeline_target_baseline.direct_peer_transfers) +
+                            delta(draft_pipeline.direct_peer_transfers, pipeline_draft_baseline.direct_peer_transfers);
+                        metrics.pipeline_stage0_us = delta(target_pipeline.stage0_us, pipeline_target_baseline.stage0_us) +
+                            delta(draft_pipeline.stage0_us, pipeline_draft_baseline.stage0_us);
+                        metrics.pipeline_stage1_us = delta(target_pipeline.stage1_us, pipeline_target_baseline.stage1_us) +
+                            delta(draft_pipeline.stage1_us, pipeline_draft_baseline.stage1_us);
+                        metrics.pipeline_d2h_us = delta(target_pipeline.d2h_us, pipeline_target_baseline.d2h_us) +
+                            delta(draft_pipeline.d2h_us, pipeline_draft_baseline.d2h_us);
+                        metrics.pipeline_h2d_us = delta(target_pipeline.h2d_us, pipeline_target_baseline.h2d_us) +
+                            delta(draft_pipeline.h2d_us, pipeline_draft_baseline.h2d_us);
+                        metrics.pipeline_host_staging_wait_us = delta(target_pipeline.host_staging_wait_us, pipeline_target_baseline.host_staging_wait_us) +
+                            delta(draft_pipeline.host_staging_wait_us, pipeline_draft_baseline.host_staging_wait_us);
+                        metrics.pipeline_activation_buffer_wait_us = delta(target_pipeline.activation_buffer_wait_us, pipeline_target_baseline.activation_buffer_wait_us) +
+                            delta(draft_pipeline.activation_buffer_wait_us, pipeline_draft_baseline.activation_buffer_wait_us);
+                        metrics.pipeline_timeline_stage0_us = target_pipeline.timeline_stage0_us;
+                        metrics.pipeline_timeline_stage1_us = target_pipeline.timeline_stage1_us;
+                        metrics.pipeline_overlap_us = target_pipeline.timeline_overlap_us;
+                        metrics.pipeline_window_us = target_pipeline.timeline_span_us;
+                        metrics.pipeline_timeline_dropped_intervals = target_pipeline.timeline_dropped_intervals;
+                        metrics.pipeline_timing_drops = delta(target_pipeline.timing_drops, pipeline_target_baseline.timing_drops) +
+                            delta(draft_pipeline.timing_drops, pipeline_draft_baseline.timing_drops);
+                        metrics.pipeline_microbatch_size = std::max(target_pipeline.microbatch_size, draft_pipeline.microbatch_size);
+                        metrics.pipeline_depth = target_pipeline.pipeline_depth;
+                        const uint64_t overlap_capacity = std::min(metrics.pipeline_timeline_stage0_us, metrics.pipeline_timeline_stage1_us);
+                        if (overlap_capacity != 0) {
+                            const double overlap = static_cast<double>(std::min(metrics.pipeline_overlap_us, overlap_capacity)) / overlap_capacity;
+                            metrics.pipeline_bubble_ratio = 1.0 - overlap;
+                        }
+                    }
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
+                        reset_pipeline_observation(false);
                     }
                     queue_results.send(std::move(res));
                 } break;
@@ -2697,6 +2939,15 @@ private:
 #endif
 
     void update_slots() {
+        const int64_t scheduler_iteration_start = ggml_time_us();
+        struct scheduler_iteration_guard {
+            server_metrics & metrics;
+            int64_t start;
+            ~scheduler_iteration_guard() {
+                ++metrics.scheduler_iteration_count;
+                metrics.scheduler_iteration_us += ggml_time_us() - start;
+            }
+        } scheduler_guard { metrics, scheduler_iteration_start };
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2775,6 +3026,7 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int64_t scheduler_t_start = ggml_time_us();
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2808,6 +3060,16 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+
+            if (continuous_scheduler) {
+                size_t prefill_tokens = 0;
+                for (int32_t i = off; i < off + n_tokens; ++i) {
+                    prefill_tokens += batch.tokens[i].is_prompt ? 1 : 0;
+                }
+                if (prefill_tokens == 0) {
+                    continuous_scheduler->observe(0, n_tokens, ggml_time_us() - scheduler_t_start);
+                }
             }
         }
     }
@@ -2880,6 +3142,58 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        server_schedule_plan schedule_plan;
+        std::vector<server_slot *> scheduled_decode;
+        std::vector<server_slot *> scheduled_prefill;
+        if (continuous_scheduler) {
+            std::vector<server_schedule_request> requests;
+            for (auto & slot : slots) {
+                if (!slot.is_processing() || !slot.task) {
+                    continue;
+                }
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    requests.push_back({
+                        slot.id,
+                        slot.task->id,
+                        server_schedule_phase::decode,
+                        static_cast<uint64_t>(slot.t_task_started),
+                        static_cast<uint64_t>(std::max<int64_t>(slot.stats.t_gen_last, slot.stats.t_prompt_last)),
+                        0,
+                        false,
+                    });
+                } else if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    const size_t prompt_tokens = slot.task->tokens.size();
+                    const size_t cached_tokens = std::min(prompt_tokens, slot.prompt.tokens.size());
+                    requests.push_back({
+                        slot.id,
+                        slot.task->id,
+                        server_schedule_phase::prefill,
+                        static_cast<uint64_t>(slot.t_task_started),
+                        static_cast<uint64_t>(slot.stats.t_prompt_last),
+                        std::max<size_t>(1, prompt_tokens - cached_tokens),
+                        cached_tokens > 0,
+                    });
+                }
+            }
+            schedule_plan = continuous_scheduler->plan(requests, ggml_time_us());
+            metrics.scheduler_deadline_misses += schedule_plan.deadline_misses;
+            metrics.scheduler_prefill_starvation_us = std::max(metrics.scheduler_prefill_starvation_us, schedule_plan.max_prefill_wait_us);
+            for (int id : schedule_plan.decode_order) {
+                scheduled_decode.push_back(&slots[id]);
+            }
+            for (const auto & allocation : schedule_plan.prefill) {
+                scheduled_prefill.push_back(&slots[allocation.id]);
+            }
+        } else {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    scheduled_decode.push_back(&slot);
+                } else if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    scheduled_prefill.push_back(&slot);
+                }
+            }
+        }
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -2887,7 +3201,7 @@ private:
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
-        iterate(slots, [&](server_slot & slot) {
+        iterate(scheduled_decode, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3009,6 +3323,16 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        int32_t prompt_batch_limit = n_batch;
+        std::unordered_map<int, size_t> prompt_quotas;
+        if (continuous_scheduler) {
+            size_t total_prefill = 0;
+            for (const auto & allocation : schedule_plan.prefill) {
+                prompt_quotas.emplace(allocation.id, allocation.tokens);
+                total_prefill += allocation.tokens;
+            }
+            prompt_batch_limit = std::min<int32_t>(n_batch, batch.size() + total_prefill);
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3017,8 +3341,8 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+            iterate(scheduled_prefill, [&](server_slot & slot) {
+                if (!add_ok || batch.size() >= prompt_batch_limit) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3043,6 +3367,7 @@ private:
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
+                    const size_t slot_prompt_limit = continuous_scheduler ? prompt_quotas[slot.id] : static_cast<size_t>(prompt_batch_limit);
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -3426,7 +3751,8 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < prompt_batch_limit &&
+                            static_cast<size_t>(batch.size() - n_tokens_prev) < slot_prompt_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3485,6 +3811,9 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (continuous_scheduler && n_tokens_cur > 0) {
+                        continuous_scheduler->commit_prefill(slot.id, slot.task->id, n_tokens_cur, ggml_time_us());
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -3583,12 +3912,20 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
-                llama_synchronize(ctx_tgt);
-            }
-        });
+        arm_watchdog(1, batch_view.n_tokens);
+        try {
+            queue_tasks.yield_to_queue([&]() {
+                ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && has_output) {
+                    arm_watchdog(2, batch_view.n_tokens);
+                    llama_synchronize(ctx_tgt);
+                }
+            });
+        } catch (...) {
+            disarm_watchdog();
+            throw;
+        }
+        disarm_watchdog();
 
         if (ret != 0) {
             {
@@ -3626,6 +3963,10 @@ private:
                     }
 
                     // stop, do not retry with smaller batch size
+                    if (server_qwen38_profile_enabled(params_base) && ret < -1) {
+                        common_log_flush(common_log_main());
+                        std::_Exit(71);
+                    }
                     throw std::runtime_error(err);
                 }
             }
@@ -3740,6 +4081,8 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                slot.graph_decode_start_tgt = llama_get_graph_stats(slot.ctx_tgt);
+                slot.graph_decode_start_dft = llama_get_graph_stats(slot.ctx_dft);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -3956,7 +4299,11 @@ private:
         if (n_prompt_queued == 0) {
             return;
         }
-        metrics.add_prompt(n_prompt_queued, ggml_time_us() - t_prompt_start);
+        const uint64_t elapsed_us = ggml_time_us() - t_prompt_start;
+        metrics.add_prompt(n_prompt_queued, elapsed_us);
+        if (continuous_scheduler) {
+            continuous_scheduler->observe(n_prompt_queued, 0, elapsed_us);
+        }
         n_prompt_queued = 0;
     }
 
@@ -4030,6 +4377,16 @@ private:
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
+        if (slot.backend_sampling_active) {
+            metrics.gpu_sampling_tokens += slot.stats.n_gen;
+        }
+
+        const auto graph_tgt = llama_get_graph_stats(slot.ctx_tgt);
+        const auto graph_dft = llama_get_graph_stats(slot.ctx_dft);
+        metrics.cuda_graph_decode_hits += graph_tgt.hits - slot.graph_decode_start_tgt.hits + graph_dft.hits - slot.graph_decode_start_dft.hits;
+        metrics.cuda_graph_decode_misses += graph_tgt.misses - slot.graph_decode_start_tgt.misses + graph_dft.misses - slot.graph_decode_start_dft.misses;
+        metrics.cuda_graph_decode_captures += graph_tgt.captures - slot.graph_decode_start_tgt.captures + graph_dft.captures - slot.graph_decode_start_dft.captures;
+        metrics.cuda_graph_decode_fallbacks += graph_tgt.fallbacks - slot.graph_decode_start_tgt.fallbacks + graph_dft.fallbacks - slot.graph_decode_start_dft.fallbacks;
 
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;
@@ -4163,6 +4520,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
+    const std::string response_id = json_value(data, "__response_id", std::string());
     auto & rd = res->rd;
     auto & params = this->params;
 
@@ -4225,6 +4583,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            task.params.oai_resp_id       = response_id;
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -4257,6 +4616,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             json arr = json::array();
             for (auto & res : all_results.results) {
                 GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
+                if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    auto * final = static_cast<server_task_result_cmpl_final *>(res.get());
+                    server_responses_history_complete(final->oai_resp_id, final->oaicompat_msg);
+                }
                 arr.push_back(res->to_json());
             }
             GGML_ASSERT(!arr.empty() && "empty results");
@@ -4294,6 +4657,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
+
+        if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            if (auto * final = dynamic_cast<server_task_result_cmpl_final *>(first_result.get())) {
+                server_responses_history_complete(final->oai_resp_id, final->oaicompat_msg);
+            }
+        }
 
         // next responses are streamed
         // to be sent immediately
@@ -4394,6 +4763,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
+                    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                        if (auto * final = dynamic_cast<server_task_result_cmpl_final *>(result.get())) {
+                            server_responses_history_complete(final->oai_resp_id, final->oaicompat_msg);
+                        }
+                    }
                     json res_json = result->to_json();
                     if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
@@ -4449,6 +4823,65 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_debug_profile = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (!server_qwen38_profile_enabled(params)) {
+            res->error(format_error_response("No deployment profile is active", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const auto page_stats = ctx_server.qwen38_page_stats();
+        const auto watchdog = ctx_server.qwen38_watchdog_status();
+        res->ok({
+            {"profile", params.deployment_profile},
+            {"max_model_len", params.n_ctx},
+            {"max_num_seqs", params.n_parallel},
+            {"max_num_batched_tokens", params.max_num_batched_tokens},
+            {"gpu_memory_reserve_mib", params.gpu_memory_reserve_mib},
+            {"kv_page_size", params.kv_page_size},
+            {"kv_paged_storage", params.kv_paged_storage},
+            {"scheduler_target_step_ms", params.scheduler_target_step_ms},
+            {"autotune", {
+                {"mode", params.autotune_mode},
+                {"cache_path", params.autotune_cache_path},
+                {"key_sha256", params.autotune_cache_key_sha256},
+            }},
+            {"cuda_watchdog", {
+                {"timeout_ms", watchdog.first},
+                {"active_stage", watchdog.second},
+            }},
+            {"kv_cache_type_k", ggml_type_name(params.cache_type_k)},
+            {"kv_cache_type_v", ggml_type_name(params.cache_type_v)},
+            {"split_mode", "layer"},
+            {"layer_boundary", {
+                {"gpu0", params.qwen38_layer_boundary},
+                {"gpu1", 64 - params.qwen38_layer_boundary},
+            }},
+            {"transfer_mode", params.cuda_p2p_active ? "cuda_peer" : "pinned_host_staged"},
+            {"speculative_types", common_speculative_type_name_str(params.speculative.types)},
+            {"mtp_max_draft", params.speculative.draft.n_max},
+            {"vision", false},
+            {"yarn", false},
+            {"cpu_kv", false},
+            {"backend_sampling", params.sampling.backend_sampling},
+            {"page_pool", {
+                {"total_pages", page_stats.total_pages},
+                {"free_pages", page_stats.free_pages},
+                {"physical_pages_gpu0", page_stats.physical_pages[0]},
+                {"physical_pages_gpu1", page_stats.physical_pages[1]},
+                {"free_physical_pages_gpu0", page_stats.free_physical_pages[0]},
+                {"free_physical_pages_gpu1", page_stats.free_physical_pages[1]},
+                {"resident_sequences", page_stats.resident_sequences},
+                {"admitted_pages", page_stats.admitted_pages},
+                {"committed_pages", page_stats.committed_pages},
+                {"cow_pages", page_stats.cow_pages},
+                {"allocation_failures", page_stats.allocation_failures},
+                {"cached_prefixes", page_stats.cached_prefixes},
+                {"cached_prefix_pages", page_stats.cached_prefix_pages},
+            }},
+        });
+        return res;
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {
@@ -4485,6 +4918,131 @@ void server_routes::init_routes() {
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = res_task->to_metrics();
+        return res;
+    };
+
+    this->get_debug_scheduler = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!server_qwen38_profile_enabled(params)) {
+            res->error(format_error_response("No deployment profile is active", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        server_task task(SERVER_TASK_TYPE_METRICS);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task), true);
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * data = dynamic_cast<server_task_result_metrics *>(result.get());
+        GGML_ASSERT(data != nullptr);
+        res->ok({
+            {"policy", "deadline_fair_wdrr"},
+            {"target_step_ms", params.scheduler_target_step_ms},
+            {"page_size", params.kv_page_size},
+            {"active_sequences", data->n_processing_slots},
+            {"waiting_sequences", data->n_tasks_deferred},
+            {"deadline_misses", data->metrics.scheduler_deadline_misses},
+            {"max_prefill_wait_ms", data->metrics.scheduler_prefill_starvation_us / 1000.0},
+            {"prefill_us_per_token", data->metrics.scheduler_prefill_us_per_token},
+            {"decode_us_per_token", data->metrics.scheduler_decode_us_per_token},
+        });
+        return res;
+    };
+
+    this->get_debug_graphs = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!server_qwen38_profile_enabled(params)) {
+            res->error(format_error_response("No deployment profile is active", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        server_task task(SERVER_TASK_TYPE_METRICS);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * data = dynamic_cast<server_task_result_metrics *>(result.get());
+        GGML_ASSERT(data != nullptr);
+        const auto & graph = data->metrics;
+        const uint64_t launches = graph.cuda_graph_hits + graph.cuda_graph_captures;
+        const uint64_t attempts = launches + graph.cuda_graph_misses;
+        const uint64_t decode_attempts = graph.cuda_graph_decode_hits + graph.cuda_graph_decode_misses + graph.cuda_graph_decode_captures;
+        res->ok({
+            {"hits", graph.cuda_graph_hits},
+            {"misses", graph.cuda_graph_misses},
+            {"captures", graph.cuda_graph_captures},
+            {"fallbacks", graph.cuda_graph_fallbacks},
+            {"cache_entries", graph.cuda_graph_cache_entries},
+            {"capture_ms", graph.cuda_graph_capture_us / 1000.0},
+            {"hit_rate", attempts == 0 ? 0.0 : static_cast<double>(graph.cuda_graph_hits) / attempts},
+            {"decode", {
+                {"hits", graph.cuda_graph_decode_hits},
+                {"misses", graph.cuda_graph_decode_misses},
+                {"captures", graph.cuda_graph_decode_captures},
+                {"fallbacks", graph.cuda_graph_decode_fallbacks},
+                {"hit_rate", decode_attempts == 0 ? 0.0 : static_cast<double>(graph.cuda_graph_decode_hits) / decode_attempts},
+            }},
+            {"target", {
+                {"hits", graph.cuda_graph_target.hits},
+                {"misses", graph.cuda_graph_target.misses},
+                {"captures", graph.cuda_graph_target.captures},
+                {"fallbacks", graph.cuda_graph_target.fallbacks},
+                {"cache_entries", graph.cuda_graph_target.cache_entries},
+            }},
+            {"draft", {
+                {"hits", graph.cuda_graph_draft.hits},
+                {"misses", graph.cuda_graph_draft.misses},
+                {"captures", graph.cuda_graph_draft.captures},
+                {"fallbacks", graph.cuda_graph_draft.fallbacks},
+                {"cache_entries", graph.cuda_graph_draft.cache_entries},
+            }},
+            {"output_transfer", {
+                {"raw_logits_bytes", graph.gpu_raw_logits_d2h_bytes},
+                {"sampled_output_bytes", graph.gpu_sampled_output_d2h_bytes},
+                {"gpu_sampling_tokens", graph.gpu_sampling_tokens},
+                {"fallbacks", graph.gpu_sampling_fallbacks},
+            }},
+            {"pipeline_transfer", {
+                {"mode", params.cuda_p2p_active ? "cuda_peer" : "pinned_host_staged"},
+                {"host_staged_transfers", graph.pipeline_host_staged_transfers},
+                {"d2h_bytes", graph.pipeline_d2h_bytes},
+                {"h2d_bytes", graph.pipeline_h2d_bytes},
+                {"direct_peer_transfers", graph.pipeline_direct_peer_transfers},
+                {"stage0_ms", graph.pipeline_stage0_us / 1000.0},
+                {"stage1_ms", graph.pipeline_stage1_us / 1000.0},
+                {"d2h_ms", graph.pipeline_d2h_us / 1000.0},
+                {"h2d_ms", graph.pipeline_h2d_us / 1000.0},
+                {"host_staging_wait_ms", graph.pipeline_host_staging_wait_us / 1000.0},
+                {"activation_buffer_wait_ms", graph.pipeline_activation_buffer_wait_us / 1000.0},
+                {"window_ms", graph.pipeline_window_us / 1000.0},
+                {"timeline_stage0_ms", graph.pipeline_timeline_stage0_us / 1000.0},
+                {"timeline_stage1_ms", graph.pipeline_timeline_stage1_us / 1000.0},
+                {"overlap_ms", graph.pipeline_overlap_us / 1000.0},
+                {"bubble_ratio", graph.pipeline_bubble_ratio},
+                {"timeline_dropped_intervals", graph.pipeline_timeline_dropped_intervals},
+                {"timing_drops", graph.pipeline_timing_drops},
+                {"microbatch_size", graph.pipeline_microbatch_size},
+                {"microbatch_queue_depth", data->n_tasks_deferred},
+                {"depth", graph.pipeline_depth},
+            }},
+        });
         return res;
     };
 
@@ -4796,6 +5354,7 @@ void server_routes::init_routes() {
             body,
             meta->chat_params,
             files);
+        body_parsed["__response_id"] = server_responses_history_begin(body.at("messages"));
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -5119,7 +5678,7 @@ void server_routes::init_routes() {
 }
 
 json server_routes::get_model_info() const {
-    return json {
+    json info = {
         {"id",       meta->model_name},
         {"aliases",  meta->model_aliases},
         {"tags",     meta->model_tags},
@@ -5137,6 +5696,29 @@ json server_routes::get_model_info() const {
             {"ftype",       meta->model_ftype},
         }},
     };
+
+    if (server_qwen38_profile_enabled(params)) {
+        info["meta"]["deployment_profile"] = params.deployment_profile;
+        info["meta"]["model_sha256"] = params.model_sha256;
+        info["meta"]["kv_cache_type_k"] = ggml_type_name(params.cache_type_k);
+        info["meta"]["kv_cache_type_v"] = ggml_type_name(params.cache_type_v);
+        info["meta"]["max_model_len"] = params.n_ctx;
+        info["meta"]["max_num_seqs"] = params.n_parallel;
+        info["meta"]["max_resident_tokens"] = params.n_ctx;
+        info["meta"]["kv_page_size"] = params.kv_page_size;
+        info["meta"]["kv_paged_storage"] = params.kv_paged_storage;
+        info["meta"]["layer_boundary"] = {
+            {"gpu0", params.qwen38_layer_boundary},
+            {"gpu1", 64 - params.qwen38_layer_boundary},
+        };
+        info["meta"]["transfer_mode"] = params.cuda_p2p_active ? "cuda_peer" : "pinned_host_staged";
+        info["meta"]["speculative_types"] = common_speculative_type_name_str(params.speculative.types);
+        info["meta"]["mtp_max_draft"] = params.speculative.draft.n_max;
+        info["meta"]["vision"] = false;
+        info["meta"]["yarn"] = false;
+    }
+
+    return info;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {

@@ -3142,10 +3142,18 @@ static void func_args_not_string(json & messages) {
                     auto & args = tool_call["function"]["arguments"];
                     if (args.is_string()) {
                         try {
-                            args = json::parse(args.get<std::string>());
+                            json parsed = json::parse(args.get<std::string>());
+                            if (!parsed.is_object()) {
+                                throw std::invalid_argument("Tool call arguments must decode to a JSON object");
+                            }
+                            args = std::move(parsed);
+                        } catch (const std::invalid_argument &) {
+                            throw;
                         } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                            throw std::invalid_argument("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
                         }
+                    } else if (!args.is_object()) {
+                        throw std::invalid_argument("Tool call arguments must be a JSON object or an encoded JSON object");
                     }
                 }
             }

@@ -97,6 +97,26 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : not enough prompt tokens\n", __func__);
         return 1;
     }
+    std::vector<llama_token> tokens_failed_rollback = tokens;
+    tokens_failed_rollback.resize(n_rs_seq + 2, tokens_failed_rollback.back());
+
+    llama_context * ctx_failed_rollback = make_ctx(params, model);
+    if (ctx_failed_rollback == nullptr || !decode_tokens(ctx_failed_rollback, tokens_failed_rollback, tokens_failed_rollback.size())) {
+        fprintf(stderr, "%s : failed to prepare the failed-rollback context\n", __func__);
+        return 1;
+    }
+    llama_memory_t mem_failed_rollback = llama_get_memory(ctx_failed_rollback);
+    const llama_pos pos_before_failed_rollback = llama_memory_seq_pos_max(mem_failed_rollback, 0);
+    if (llama_memory_seq_rm(mem_failed_rollback, 0, 1, -1)) {
+        fprintf(stderr, "%s : rollback beyond the checkpoint window unexpectedly succeeded\n", __func__);
+        return 1;
+    }
+    if (llama_memory_seq_pos_max(mem_failed_rollback, 0) != pos_before_failed_rollback) {
+        fprintf(stderr, "%s : failed rollback changed the hybrid sequence position\n", __func__);
+        return 1;
+    }
+    llama_free(ctx_failed_rollback);
+
     tokens.resize(n_rs_seq + 1, tokens.back());
 
     const uint32_t  n_tokens     = tokens.size();
@@ -109,6 +129,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to decode prompt\n", __func__);
         return 1;
     }
+
     if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1)) {
         fprintf(stderr, "%s : rollback failed\n", __func__);
         return 1;

@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+
+PROFILE = "qwen38-27b-q8-2x3090"
+TOTAL_PLACEMENT_LAYERS = 66
+MODEL_LAYERS = 64
+
+
+def command_output(command, timeout=None):
+    result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=timeout)
+    return result.stdout + result.stderr
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as input_file:
+        for chunk in iter(lambda: input_file.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def text_sha256(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def canonical_sha256(value):
+    return text_sha256(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def parse_nvidia_smi(output):
+    rows = []
+    for row in csv.reader(line for line in output.splitlines() if line.strip()):
+        if len(row) != 6:
+            raise RuntimeError("unexpected nvidia-smi GPU row")
+        rows.append({
+            "uuid": row[0].strip(),
+            "name": row[1].strip(),
+            "driver_version": row[2].strip(),
+            "power_limit_w": float(row[3].strip()),
+            "pci_bus_id": row[4].strip(),
+            "memory_total_mib": int(row[5].strip()),
+        })
+    if len(rows) != 2:
+        raise RuntimeError("tuner requires exactly two visible GPUs")
+    return rows
+
+
+def cuda_toolkit_version():
+    output = command_output(["nvcc", "--version"])
+    match = re.search(r"release\s+([0-9.]+)", output)
+    if match is None:
+        raise RuntimeError("unable to parse CUDA toolkit version")
+    return match.group(1)
+
+
+def git_commit(source_dir):
+    return command_output(["git", "rev-parse", "HEAD"], timeout=30).strip()
+
+
+def fork_patch_version(source_dir):
+    manifest = pathlib.Path(source_dir) / "docs" / "fork-patch-manifest.md"
+    if not manifest.is_file():
+        raise RuntimeError("fork patch manifest is missing")
+    return file_sha256(manifest)
+
+
+def gguf_inventory_sha256(model, llama_gguf):
+    output = command_output([llama_gguf, model, "r", "n"], timeout=300)
+    inventory = [line.strip() for line in output.splitlines() if "n_tensors:" in line or "tensor[" in line]
+    if not inventory:
+        raise RuntimeError("llama-gguf returned no tensor inventory")
+    return text_sha256("\n".join(inventory))
+
+
+def collect_key(args):
+    gpu_query = "uuid,name,driver_version,power.limit,pci.bus_id,memory.total"
+    gpu_rows = parse_nvidia_smi(command_output([
+        "nvidia-smi", "--query-gpu=" + gpu_query, "--format=csv,noheader,nounits",
+    ], timeout=30))
+    topology = command_output(["nvidia-smi", "topo", "-m"], timeout=30)
+    return {
+        "model_sha256": file_sha256(args.model),
+        "gguf_inventory_sha256": gguf_inventory_sha256(args.model, args.llama_gguf),
+        "llama_commit": args.llama_commit or git_commit(args.source_dir),
+        "fork_patch_version": args.fork_patch_version or fork_patch_version(args.source_dir),
+        "cuda_toolkit": cuda_toolkit_version(),
+        "driver_version": gpu_rows[0]["driver_version"],
+        "gpu_uuids": [row["uuid"] for row in gpu_rows],
+        "power_limits_w": [row["power_limit_w"] for row in gpu_rows],
+        "pcie_topology_sha256": text_sha256(topology),
+        "kv_codec": "q8_0",
+        "max_resident_sequences": 8,
+    }, {"gpus": gpu_rows, "topology": topology}
+
+
+def candidate_grid(quick):
+    boundaries = [32, 36] if quick else [28, 32, 36]
+    max_batches = [1024, 2048]
+    ubatches = [32, 64] if quick else [16, 32, 64]
+    prompts = [4096] if quick else [4096, 32768, 131072]
+    return [{
+        "layer_boundary": boundary,
+        "split": "%d/%d" % (boundary, TOTAL_PLACEMENT_LAYERS - boundary),
+        "max_num_batched_tokens": max_batch,
+        "ubatch_size": ubatch,
+        "prompt_tokens": prompt,
+    } for boundary in boundaries for max_batch in max_batches for ubatch in ubatches
+      if ubatch <= max_batch for prompt in prompts]
+
+
+def benchmark(args, candidate):
+    command = [
+        args.llama_bench,
+        "-m", args.model,
+        "-ngl", "999",
+        "-sm", "layer",
+        "-ts", candidate["split"],
+        "-ctk", "q8_0",
+        "-ctv", "q8_0",
+        "-fa", "on",
+        "-b", str(candidate["max_num_batched_tokens"]),
+        "-ub", str(candidate["ubatch_size"]),
+        "-p", str(candidate["prompt_tokens"]),
+        "-n", "128",
+        "-r", str(args.repetitions),
+        "-o", "jsonl",
+    ]
+    started = time.time()
+    try:
+        output = command_output(command, timeout=args.timeout)
+        rows = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+        prompt_rates = [row["avg_ts"] for row in rows if row.get("n_prompt", 0) > 0]
+        decode_rates = [row["avg_ts"] for row in rows if row.get("n_gen", 0) > 0]
+        if not prompt_rates or not decode_rates:
+            raise RuntimeError("llama-bench did not return prompt and decode measurements")
+        score = math.sqrt(
+            sum(prompt_rates) / len(prompt_rates) *
+            sum(decode_rates) / len(decode_rates)
+        )
+        return {
+            **candidate,
+            "success": True,
+            "score": score,
+            "rows": rows,
+            "command": command,
+            "elapsed_seconds": time.time() - started,
+        }
+    except Exception as exception:
+        return {
+            **candidate,
+            "success": False,
+            "error": "%s: %s" % (type(exception).__name__, exception),
+            "command": command,
+            "elapsed_seconds": time.time() - started,
+        }
+
+
+def select_candidate(results, required_prompt_sizes):
+    grouped = {}
+    for result in results:
+        key = (
+            result["layer_boundary"],
+            result["max_num_batched_tokens"],
+            result["ubatch_size"],
+        )
+        grouped.setdefault(key, []).append(result)
+
+    eligible = {}
+    for key, rows in grouped.items():
+        successful_prompts = {row["prompt_tokens"] for row in rows if row["success"]}
+        if successful_prompts == set(required_prompt_sizes) and all(row["success"] for row in rows):
+            eligible[key] = min(row["score"] for row in rows)
+    if not eligible:
+        raise RuntimeError("no candidate passed every required prompt size")
+    selected_key = max(eligible, key=eligible.get)
+    return {
+        "layer_boundary": selected_key[0],
+        "max_num_batched_tokens": selected_key[1],
+        "prefill_chunk_size": selected_key[1],
+        "ubatch_size": selected_key[2],
+        "kv_page_size": 16,
+        "scheduler_target_step_ms": 10.0,
+        "mtp_n_max": 2,
+        "pipeline_depth": 2,
+        "activation_buffer_count": 3,
+        "robust_microbenchmark_score": eligible[selected_key],
+    }
+
+
+def dry_run_selection():
+    return {
+        "layer_boundary": 36,
+        "max_num_batched_tokens": 2048,
+        "prefill_chunk_size": 2048,
+        "ubatch_size": 64,
+        "kv_page_size": 16,
+        "scheduler_target_step_ms": 10.0,
+        "mtp_n_max": 2,
+        "pipeline_depth": 2,
+        "activation_buffer_count": 3,
+        "robust_microbenchmark_score": 0.0,
+    }
+
+
+def validate_server_evidence(paths, key, selected):
+    required_scenarios = {
+        "single_short", "single_32k", "single_128k", "eight_decode",
+        "mixed_prefill_decode", "eight_varied_prefill", "shared_prefix_fork",
+        "coding_agent_tool_loop",
+    }
+    covered = set()
+    checks = []
+    pipeline_ok = False
+    graph_ok = False
+    vram_peak_ok = False
+    expected_split = "%d/%d" % (selected["layer_boundary"], MODEL_LAYERS - selected["layer_boundary"])
+    for path in paths:
+        try:
+            artifact = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            manifest = artifact["manifest"]
+            axes = manifest["deployment_axes"]
+            artifact_ok = artifact.get("schema_version") == 2 and not artifact.get("quick", True) and \
+                manifest.get("model_sha256") == key["model_sha256"] and \
+                manifest.get("source_commit") == key["llama_commit"] and \
+                manifest.get("validation", {}).get("status") == "pass" and \
+                axes.get("kv_mode") == "q8_0" and axes.get("pipeline") == "on" and \
+                axes.get("cuda_graph") == "on" and axes.get("split_boundary") == expected_split
+            checks.append({"path": str(path), "artifact": artifact_ok})
+            if not artifact_ok:
+                continue
+            covered.update(result["name"] for result in artifact.get("scenarios", []) if result.get("success"))
+            graphs = manifest.get("after", {}).get("server", {}).get("graphs", {})
+            graph = graphs.get("value", {}) if graphs.get("ok") else {}
+            pipeline = graph.get("pipeline_transfer", {})
+            pipeline_ok = pipeline_ok or (
+                pipeline.get("mode") == "pinned_host_staged" and
+                pipeline.get("direct_peer_transfers") == 0 and
+                pipeline.get("d2h_bytes", 0) > 0 and
+                pipeline.get("d2h_bytes") == pipeline.get("h2d_bytes") and
+                pipeline.get("depth") == 2
+            )
+            graph_ok = graph_ok or int(graph.get("hits", 0)) + int(graph.get("captures", 0)) > 0
+            peak = manifest.get("gpu_memory_peak", {})
+            vram_peak_ok = vram_peak_ok or len(peak.get("peaks_mib", [])) == 2 and peak.get("samples", 0) > 0
+        except Exception as exception:
+            checks.append({"path": str(path), "artifact": False, "error": "%s: %s" % (type(exception).__name__, exception)})
+    missing = sorted(required_scenarios - covered)
+    status = "pass" if not missing and pipeline_ok and graph_ok and vram_peak_ok else "incomplete"
+    return {
+        "status": status,
+        "required_scenarios": sorted(required_scenarios),
+        "covered_scenarios": sorted(covered),
+        "missing_scenarios": missing,
+        "pinned_host_pipeline": pipeline_ok,
+        "cuda_graph": graph_ok,
+        "vram_peak": vram_peak_ok,
+        "artifacts": checks,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Tune Qwen3.8-27B Q8 on two RTX 3090 GPUs")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--llama-bench", default="./build-qwen38-3090/bin/llama-bench")
+    parser.add_argument("--llama-gguf", default="./build-qwen38-3090/bin/llama-gguf")
+    parser.add_argument("--source-dir", default=str(pathlib.Path(__file__).resolve().parent.parent))
+    parser.add_argument("--llama-commit", default="")
+    parser.add_argument("--fork-patch-version", default="")
+    parser.add_argument("--output", default="qwen38-tuning.json")
+    parser.add_argument("--evidence", action="append", default=[])
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--timeout", type=int, default=7200)
+    args = parser.parse_args()
+
+    if not pathlib.Path(args.model).is_file():
+        parser.error("model file does not exist")
+    if not pathlib.Path(args.llama_gguf).is_file():
+        parser.error("llama-gguf executable does not exist")
+    if not args.dry_run and not pathlib.Path(args.llama_bench).is_file():
+        parser.error("llama-bench executable does not exist")
+    if args.repetitions < 1:
+        parser.error("repetitions must be positive")
+
+    started = time.time()
+    key, system = collect_key(args)
+    candidates = candidate_grid(args.quick)
+    results = []
+    if args.dry_run:
+        selected = dry_run_selection()
+    else:
+        for index, candidate in enumerate(candidates, 1):
+            print("tuning %d/%d split=%s batch=%d ubatch=%d prompt=%d" % (
+                index, len(candidates), candidate["split"], candidate["max_num_batched_tokens"],
+                candidate["ubatch_size"], candidate["prompt_tokens"]), file=sys.stderr)
+            results.append(benchmark(args, candidate))
+        required_prompts = sorted({candidate["prompt_tokens"] for candidate in candidates})
+        selected = select_candidate(results, required_prompts)
+
+    server_validation = validate_server_evidence(args.evidence, key, selected)
+    validated = not args.dry_run and server_validation["status"] == "pass"
+
+    payload = {
+        "schema_version": 2,
+        "profile": PROFILE,
+        "validated": validated,
+        "microbenchmark_passed": not args.dry_run,
+        "key": key,
+        "key_sha256": canonical_sha256(key),
+        "system": system,
+        "selected": selected,
+        "search_coverage": {
+            "measured": ["layer_boundary", "max_num_batched_tokens", "ubatch_size", "single_agent_4k_32k_128k"],
+            "fixed": ["prefill_chunk_size", "kv_page_size", "scheduler_target_step_ms", "mtp_n_max", "pipeline_depth", "activation_buffer_count"],
+            "pending_server_suite": ["eight_agent_decode", "mixed_prefill_decode", "pinned_host_overlap", "stage_imbalance", "vram_peak", "graph_capture"],
+        },
+        "server_validation": server_validation,
+        "candidates": candidates,
+        "results": results,
+        "elapsed_seconds": time.time() - started,
+    }
+    pathlib.Path(args.output).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({
+        "validated": payload["validated"],
+        "key_sha256": payload["key_sha256"],
+        "selected": payload["selected"],
+    }, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

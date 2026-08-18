@@ -150,9 +150,9 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
-task_result_state::task_result_state(const common_chat_parser_params & chat_parser_params)
+task_result_state::task_result_state(const common_chat_parser_params & chat_parser_params, const std::string & response_id)
     : chat_parser_params(chat_parser_params)
-    , oai_resp_id("resp_" + random_string())
+    , oai_resp_id(response_id.empty() ? "resp_" + random_string() : response_id)
     , oai_resp_reasoning_id("rs_" + random_string())
     , oai_resp_message_id("msg_" + random_string()) {
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
@@ -1528,6 +1528,122 @@ std::string server_task_result_metrics::to_metrics() {
             "Number of prompt tokens reused from the cache",
             (double) metrics.n_prompt_cached
         }, {
+            "kv_prefix_hit_tokens",
+            "Number of tokens attached from resident paged prefixes",
+            (double) metrics.kv_prefix_hit_tokens
+        }, {
+            "kv_prefix_miss_tokens",
+            "Number of prompt tokens not served by resident paged prefixes",
+            (double) metrics.kv_prefix_miss_tokens
+        }, {
+            "kv_prefix_evictions",
+            "Number of resident paged prefix entries evicted",
+            (double) metrics.kv_prefix_evictions
+        }, {
+            "scheduler_deadline_misses",
+            "Number of decode soft deadlines missed",
+            (double) metrics.scheduler_deadline_misses
+        }, {
+            "scheduler_iteration_seconds",
+            "Total time spent in scheduler iterations",
+            metrics.scheduler_iteration_us / 1.e6
+        }, {
+            "cuda_graph_hits",
+            "Number of CUDA Graph launches using an existing executable",
+            (double) metrics.cuda_graph_hits
+        }, {
+            "cuda_graph_misses",
+            "Number of CUDA graph executions that used the eager path",
+            (double) metrics.cuda_graph_misses
+        }, {
+            "cuda_graph_fallbacks",
+            "Number of CUDA graph executions that fell back to eager execution",
+            (double) metrics.cuda_graph_fallbacks
+        }, {
+            "cuda_graph_captures",
+            "Number of CUDA Graph captures",
+            (double) metrics.cuda_graph_captures
+        }, {
+            "cuda_graph_capture_seconds",
+            "Total CPU time spent capturing CUDA Graphs",
+            metrics.cuda_graph_capture_us / 1.e6
+        }, {
+            "cuda_graph_decode_hits",
+            "Number of hot decode CUDA Graph hits",
+            (double) metrics.cuda_graph_decode_hits
+        }, {
+            "cuda_graph_decode_misses",
+            "Number of hot decode CUDA Graph misses",
+            (double) metrics.cuda_graph_decode_misses
+        }, {
+            "cuda_graph_decode_captures",
+            "Number of CUDA Graph captures during hot decode",
+            (double) metrics.cuda_graph_decode_captures
+        }, {
+            "cuda_graph_decode_fallbacks",
+            "Number of eager fallbacks during hot decode",
+            (double) metrics.cuda_graph_decode_fallbacks
+        }, {
+            "gpu_sampling_tokens",
+            "Number of tokens selected by backend sampling",
+            (double) metrics.gpu_sampling_tokens
+        }, {
+            "gpu_sampling_fallbacks",
+            "Number of requests that fell back to CPU sampling",
+            (double) metrics.gpu_sampling_fallbacks
+        }, {
+            "gpu_raw_logits_d2h_bytes",
+            "Raw full-vocabulary logits copied from GPU to host",
+            (double) metrics.gpu_raw_logits_d2h_bytes
+        }, {
+            "gpu_sampled_output_d2h_bytes",
+            "Reduced backend-sampling output copied from GPU to host",
+            (double) metrics.gpu_sampled_output_d2h_bytes
+        }, {
+            "pipeline_host_staged_transfers",
+            "Number of stage-boundary transfers through pinned host memory",
+            (double) metrics.pipeline_host_staged_transfers
+        }, {
+            "gpu_interstage_d2h_bytes",
+            "Stage-boundary bytes copied from GPU to pinned host memory",
+            (double) metrics.pipeline_d2h_bytes
+        }, {
+            "gpu_interstage_h2d_bytes",
+            "Stage-boundary bytes copied from pinned host memory to GPU",
+            (double) metrics.pipeline_h2d_bytes
+        }, {
+            "pipeline_direct_peer_transfers",
+            "Number of direct peer stage-boundary transfers",
+            (double) metrics.pipeline_direct_peer_transfers
+        }, {
+            "pipeline_stage0_seconds",
+            "Cumulative CUDA busy time for pipeline stage 0",
+            metrics.pipeline_stage0_us / 1.e6
+        }, {
+            "pipeline_stage1_seconds",
+            "Cumulative CUDA busy time for pipeline stage 1",
+            metrics.pipeline_stage1_us / 1.e6
+        }, {
+            "pipeline_d2h_seconds",
+            "Cumulative stage-boundary device-to-host copy time",
+            metrics.pipeline_d2h_us / 1.e6
+        }, {
+            "pipeline_h2d_seconds",
+            "Cumulative stage-boundary host-to-device copy time",
+            metrics.pipeline_h2d_us / 1.e6
+        }, {
+            "pipeline_host_staging_wait_seconds",
+            "Cumulative wait before reusing a pinned host staging slot",
+            metrics.pipeline_host_staging_wait_us / 1.e6
+        }, {
+            "pipeline_activation_buffer_wait_seconds",
+            "Cumulative wait before reusing a device activation buffer",
+            metrics.pipeline_activation_buffer_wait_us / 1.e6
+        }, {
+            "pipeline_timing_drops",
+            "Number of timing samples dropped because the bounded event ring was full",
+            (double) metrics.pipeline_timing_drops
+        }, {
             "prompt_seconds_total",
             "Total time spent processing prompts",
             metrics.prompt.time / 1.e6
@@ -1579,6 +1695,54 @@ std::string server_task_result_metrics::to_metrics() {
             "requests_deferred",
             "Number of requests deferred",
             (double) n_tasks_deferred
+        }, {
+            "scheduler_active_sequences",
+            "Number of resident sequences visible to the scheduler",
+            (double) n_processing_slots
+        }, {
+            "scheduler_waiting_sequences",
+            "Number of requests waiting for admission",
+            (double) n_tasks_deferred
+        }, {
+            "pipeline_microbatch_size",
+            "Number of sequences in the most recently submitted pipeline microbatch",
+            (double) metrics.pipeline_microbatch_size
+        }, {
+            "pipeline_microbatch_queue_depth",
+            "Number of requests waiting to enter a pipeline wavefront",
+            (double) n_tasks_deferred
+        }, {
+            "pipeline_depth",
+            "Number of target pipeline lanes",
+            (double) metrics.pipeline_depth
+        }, {
+            "pipeline_bubble_ratio",
+            "Idle fraction across both pipeline stages in the observation window",
+            metrics.pipeline_bubble_ratio
+        }, {
+            "pipeline_overlap_seconds",
+            "CUDA compute time where both pipeline stages were active",
+            metrics.pipeline_overlap_us / 1.e6
+        }, {
+            "pipeline_timeline_dropped_intervals",
+            "Number of compute intervals overwritten in the bounded timeline",
+            (double) metrics.pipeline_timeline_dropped_intervals
+        }, {
+            "scheduler_prefill_starvation_seconds",
+            "Largest observed interval without prefill progress",
+            metrics.scheduler_prefill_starvation_us / 1.e6
+        }, {
+            "scheduler_prefill_us_per_token",
+            "Scheduler EWMA prefill cost in microseconds per token",
+            metrics.scheduler_prefill_us_per_token
+        }, {
+            "scheduler_decode_us_per_token",
+            "Scheduler EWMA decode cost in microseconds per token",
+            metrics.scheduler_decode_us_per_token
+        }, {
+            "cuda_graph_cache_entries",
+            "Number of CUDA Graph cache entries across model devices",
+            (double) metrics.cuda_graph_cache_entries
         }, {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
@@ -1685,6 +1849,46 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+server_prompt_cache::~server_prompt_cache() {
+    while (!states.empty()) {
+        erase(states.begin());
+    }
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
+    if (it->cache_id != 0) {
+        index.erase(it->cache_id);
+        states_by_id.erase(it->cache_id);
+    }
+    if (it->paged_prefix_id != 0 && memory != nullptr) {
+        llama_memory_paged_prefix_release(memory, it->paged_prefix_id);
+    }
+    return states.erase(it);
+}
+
+bool server_prompt_cache::evict_one() {
+    if (states.empty()) {
+        return false;
+    }
+
+    auto victim = states.end();
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (victim == states.end() ||
+                (victim->protected_segment && !it->protected_segment) ||
+                (victim->protected_segment == it->protected_segment && it->last_use < victim->last_use)) {
+            victim = it;
+        }
+    }
+
+    SRV_WRN(" - evicting prompt cache entry (segment = %s, hits = %" PRIu64 ", size = %.3f MiB)\n",
+            victim->protected_segment ? "protected" : "probation", victim->hits, victim->size() / (1024.0 * 1024.0));
+    if (victim->paged_prefix_id != 0) {
+        ++prefix_evictions;
+    }
+    erase(victim);
+    return true;
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1705,21 +1909,31 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft,
+        const std::string & fingerprint,
+        uint64_t paged_prefix_id) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
+        if (it->fingerprint == fingerprint && cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            if (paged_prefix_id != 0 && memory != nullptr) {
+                llama_memory_paged_prefix_release(memory, paged_prefix_id);
+            }
             return nullptr;
         }
     }
 
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    if (paged_prefix_id == 0) {
+        for (const auto & ckpt : prompt.checkpoints) {
+            checkpoints_size += ckpt.size();
+        }
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1728,17 +1942,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0 && state_size_new > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        if (paged_prefix_id != 0 && memory != nullptr) {
+            llama_memory_paged_prefix_release(memory, paged_prefix_id);
+        }
         return nullptr;
     }
 
     // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
+    for (auto it = states.begin(); paged_prefix_id == 0 && it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (it->fingerprint == fingerprint && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase(it);
         } else {
             ++it;
         }
@@ -1747,10 +1964,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1770,24 +1984,48 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         update();
 
+        if (paged_prefix_id != 0 && memory != nullptr) {
+            llama_memory_paged_prefix_release(memory, paged_prefix_id);
+        }
+
         return nullptr;
     }
 
+    const uint64_t cache_id = next_cache_id++;
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ paged_prefix_id == 0 ? prompt.checkpoints : std::list<common_prompt_checkpoint>{},
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.fingerprint       =*/ fingerprint,
+        /*.paged_prefix_id   =*/ paged_prefix_id,
+        /*.last_use          =*/ ++use_clock,
+        /*.hits              =*/ 0,
+        /*.protected_segment =*/ false,
+        /*.cache_id          =*/ cache_id,
     });
 
-    return &states.back();
+    auto * state = &states.back();
+    states_by_id.emplace(cache_id, state);
+    if (paged_prefix_id != 0 && !index.insert(cache_id, state->prompt.tokens.get_tokens(), fingerprint)) {
+        erase(std::prev(states.end()));
+        return nullptr;
+    }
+
+    return state;
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        int32_t id_slot,
+        const std::string & fingerprint) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1795,10 +2033,29 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-    auto it_best = states.end();
+    server_prompt_cache_state * best = nullptr;
+
+    size_t indexed_tokens = 0;
+    const uint64_t indexed_id = index.find_longest_prefix(tokens_new.get_tokens(), fingerprint, &indexed_tokens);
+    const auto indexed = states_by_id.find(indexed_id);
+    if (indexed != states_by_id.end()) {
+        const float f_keep_cur = 1.0f;
+        const float f_sim_cur = float(indexed_tokens) / tokens_new.size();
+        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            f_keep_best = f_keep_cur;
+            f_sim_best = f_sim_cur;
+            best = indexed->second;
+        }
+    }
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->paged_prefix_id != 0) {
+            continue;
+        }
+        if (it->fingerprint != fingerprint) {
+            continue;
+        }
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
@@ -1815,30 +2072,47 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
-            it_best = it;
+            best = &*it;
         }
     }
 
-    if (it_best != states.end()) {
+    if (best != nullptr) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
-            auto & data = it_best->data.main;
+            auto & data = best->data.main;
 
             const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+            const bool paged = best->paged_prefix_id != 0;
+            if (paged) {
+                llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+                if (!llama_memory_seq_rm(mem_tgt, id_slot, -1, -1) ||
+                        !llama_memory_paged_prefix_attach(mem_tgt, id_slot, best->paged_prefix_id)) {
+                    SRV_ERR("failed to attach resident prompt prefix with %d tokens\n", best->prompt.n_tokens());
+                    return false;
+                }
+            }
+
+            const llama_state_seq_flags flags = paged ? LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY : LLAMA_STATE_SEQ_FLAGS_NONE;
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, flags);
             if (n != size) {
                 SRV_ERR("failed to restore state with size %zu\n", size);
+
+                if (paged) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+                }
 
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!paged) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
-            auto & data = it_best->data.drft;
+            auto & data = best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -1848,17 +2122,39 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
 
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (best->paged_prefix_id == 0) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+        if (best->paged_prefix_id == 0) {
+            auto it = std::find_if(states.begin(), states.end(), [&](const server_prompt_cache_state & state) {
+                return &state == best;
+            });
+            GGML_ASSERT(it != states.end());
+            prompt = std::move(best->prompt);
+            erase(it);
+        } else {
+            prefix_hit_tokens += best->prompt.tokens.size();
+            prefix_miss_tokens += tokens_new.size() - best->prompt.tokens.size();
+            prompt = best->prompt.clone();
+            best->last_use = ++use_clock;
+            ++best->hits;
+            best->protected_segment = true;
+        }
+    } else if (memory != nullptr) {
+        llama_paged_memory_stats stats;
+        if (llama_memory_paged_get_stats(memory, &stats)) {
+            prefix_miss_tokens += tokens_new.size();
+        }
     }
 
     return true;
@@ -1867,9 +2163,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1881,10 +2175,8 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            SRV_WRN(" - cache token limit reached (%zu, est: %zu)\n", limit_tokens, limit_tokens_cur);
+            evict_one();
         }
     }
 

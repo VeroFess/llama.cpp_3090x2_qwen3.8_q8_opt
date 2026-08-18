@@ -83,11 +83,15 @@ public:
     llama_kv_cache_iswa * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    void set_force_split_seq(bool v) override { force_split_seq = v; }
+
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache_iswa> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    bool force_split_seq = false;
 };
 
 class llama_memory_hybrid_iswa_context : public llama_memory_context_i {

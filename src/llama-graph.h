@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 #include <memory>
 #include <set>
@@ -624,14 +625,32 @@ public:
     const llama_cross * cross = nullptr;
 };
 
+class llm_graph_input_attn_qwen38_paged : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_attn_qwen38_paged(const llama_memory_hybrid_context * mctx) : mctx(mctx) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    std::array<ggml_tensor *, 2> write_slots = { nullptr, nullptr };
+    std::array<ggml_tensor *, 2> block_tables = { nullptr, nullptr };
+    ggml_tensor * context_lens = nullptr;
+    ggml_tensor * batch_offsets = nullptr;
+    ggml_tensor * batch_lens = nullptr;
+
+    const llama_memory_hybrid_context * mctx;
+};
+
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
 public:
     llm_graph_input_mem_hybrid(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
+            std::unique_ptr<llm_graph_input_attn_qwen38_paged> inp_paged,
             std::unique_ptr<llm_graph_input_rs>      inp_rs,
             const llama_memory_hybrid_context *      mctx) :
         inp_attn(std::move(inp_attn)),
+        inp_paged(std::move(inp_paged)),
         inp_rs(std::move(inp_rs)),
         cparams(cparams),
         mctx(mctx) { }
@@ -642,9 +661,11 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    std::unique_ptr<llm_graph_input_attn_qwen38_paged> inp_paged;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
 
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
+    llm_graph_input_attn_qwen38_paged * get_paged() const { return inp_paged.get(); }
     llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
 
     const llama_cparams cparams;

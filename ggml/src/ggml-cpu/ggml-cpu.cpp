@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_QWEN38_PAGED_ATTN:
+            return false;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

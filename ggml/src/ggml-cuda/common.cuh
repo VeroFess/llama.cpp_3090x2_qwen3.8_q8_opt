@@ -442,11 +442,11 @@ struct ggml_cuda_unroll<1> {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
-    return __reduce_add_sync(0xffffffff, x);
+    return __reduce_add_sync(0xFFFFFFFFULL, x);
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width);
     }
     return x;
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -456,7 +456,7 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width);
     }
     return x;
 }
@@ -465,8 +465,8 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
-        a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
+        a.x += __shfl_xor_sync(0xFFFFFFFFULL, a.x, offset, width);
+        a.y += __shfl_xor_sync(0xFFFFFFFFULL, a.y, offset, width);
     }
     return a;
 }
@@ -476,7 +476,7 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #ifdef FP16_AVAILABLE
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, offset, width));
+        a = __hadd2(a, __shfl_xor_sync(0xFFFFFFFFULL, a, offset, width));
     }
     return a;
 
@@ -489,11 +489,11 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_all(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
-        return __all_sync(0xffffffff, x);
+        return __all_sync(0xFFFFFFFFULL, x);
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
+            x = __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width) && x;
         }
         return x;
     }
@@ -502,11 +502,11 @@ static __device__ __forceinline__ int warp_reduce_all(int x) {
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_any(int x) {
     if (width == ggml_cuda_get_physical_warp_size()) {
-        return __any_sync(0xffffffff, x);
+        return __any_sync(0xFFFFFFFFULL, x);
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
+            x = __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width) || x;
         }
         return x;
     }
@@ -516,7 +516,7 @@ template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+        x = fmaxf(x, __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width));
     }
     return x;
 }
@@ -526,7 +526,7 @@ static __device__ __forceinline__ T warp_prefix_inclusive_sum(T x) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const T t = __shfl_up_sync(0xffffffff, x, offset, width);
+        const T t = __shfl_up_sync(0xFFFFFFFFULL, x, offset, width);
         if (lane_id >= offset) {
             x += t;
         }
@@ -539,8 +539,8 @@ static __device__ __forceinline__ float2 warp_prefix_inclusive_sum(float2 a) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const float t_x = __shfl_up_sync(0xffffffff, a.x, offset, width);
-        const float t_y = __shfl_up_sync(0xffffffff, a.y, offset, width);
+        const float t_x = __shfl_up_sync(0xFFFFFFFFULL, a.x, offset, width);
+        const float t_y = __shfl_up_sync(0xFFFFFFFFULL, a.y, offset, width);
         if (lane_id >= offset) {
             a.x += t_x;
             a.y += t_y;
@@ -555,7 +555,7 @@ static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
     const int lane_id = threadIdx.x % width;
 #pragma unroll
     for (int offset = 1; offset < width; offset <<= 1) {
-        const half2 t = __shfl_up_sync(0xffffffff, a, offset, width);
+        const half2 t = __shfl_up_sync(0xFFFFFFFFULL, a, offset, width);
         if (lane_id >= offset) {
             a = __hadd2(a, t);
         }
@@ -683,7 +683,7 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
-       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xFFFFFFFFULL, x, offset, width));
    }
    return x;
 #else
@@ -1228,6 +1228,30 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_graph_key {
+    uint64_t scheduler = 0;
+    int32_t copy = 0;
+    int32_t split = 0;
+    uint64_t topology = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return scheduler == other.scheduler && copy == other.copy && split == other.split && topology == other.topology;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        size_t result = std::hash<uint64_t>{}(key.scheduler);
+        const auto mix = [&](size_t value) {
+            result ^= value + 0x9e3779b97f4a7c15ULL + (result << 6) + (result >> 2);
+        };
+        mix(std::hash<int32_t>{}(key.copy));
+        mix(std::hash<int32_t>{}(key.split));
+        mix(std::hash<uint64_t>{}(key.topology));
+        return result;
+    }
+};
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1247,7 +1271,13 @@ struct ggml_cuda_graph {
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
-        ggml_tensor node;
+        ggml_op node_op;
+        ggml_type node_type;
+        int32_t node_flags;
+        void * node_data;
+        int64_t node_ne[GGML_MAX_DIMS];
+        size_t node_nb[GGML_MAX_DIMS];
+        uint8_t node_op_params[GGML_MAX_OP_PARAMS];
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
@@ -1422,21 +1452,35 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    uint64_t graph_hits = 0;
+    uint64_t graph_misses = 0;
+    uint64_t graph_captures = 0;
+    uint64_t graph_fallbacks = 0;
+    uint64_t graph_capture_us = 0;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
+        static const int64_t idle_limit_us = [] {
+            const char * value = getenv("GGML_CUDA_GRAPH_CACHE_IDLE_MS");
+            return value == nullptr ? 300'000'000LL : std::max<int64_t>(1, atoll(value)) * 1000;
+        }();
+        static const size_t entry_limit = [] {
+            const char * value = getenv("GGML_CUDA_GRAPH_CACHE_MAX_ENTRIES");
+            return value == nullptr ? size_t(64) : std::max<size_t>(1, strtoull(value, nullptr, 10));
+        }();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // sweep every 5s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= idle_limit_us) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1444,9 +1488,15 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            if (cuda_graphs.size() >= entry_limit) {
+                const auto oldest = std::min_element(cuda_graphs.begin(), cuda_graphs.end(), [](const auto & a, const auto & b) {
+                    return a.second->last_used_time < b.second->last_used_time;
+                });
+                cuda_graphs.erase(oldest);
+            }
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();

@@ -73,7 +73,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
         while (true) {
             llama_ubatch ubatch;
 
-            if (embd_all) {
+            // DFlash target models need per-seq ubatches so the per-ubatch slot
+            // switch in llama_context::decode() can route hidden-state capture
+            // and tape writes to the correct slot.
+            if (embd_all || force_split_seq) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {

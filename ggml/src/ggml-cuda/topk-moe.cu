@@ -195,9 +195,9 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                const float val    = __shfl_xor_sync(0xFFFFFFFFULL, max_val, mask, WARP_SIZE);
+                const float val_s  = __shfl_xor_sync(0xFFFFFFFFULL, max_val_s, mask, WARP_SIZE);
+                const int   expert = __shfl_xor_sync(0xFFFFFFFFULL, max_expert, mask, WARP_SIZE);
                 if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
                     max_val    = val;
                     max_val_s  = val_s;
@@ -220,8 +220,8 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+                const float val    = __shfl_xor_sync(0xFFFFFFFFULL, max_val, mask, WARP_SIZE);
+                const int   expert = __shfl_xor_sync(0xFFFFFFFFULL, max_expert, mask, WARP_SIZE);
                 if (val > max_val || (val == max_val && expert < max_expert)) {
                     max_val    = val;
                     max_expert = expert;

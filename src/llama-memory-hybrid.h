@@ -5,6 +5,8 @@
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
+#include "llama-paged-block-manager.h"
+#include "llama-paged-kv-pool.h"
 
 #include <memory>
 #include <vector>
@@ -25,6 +27,7 @@ public:
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
+                 uint32_t   page_size,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
@@ -37,6 +40,7 @@ public:
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+                     bool   paged_storage,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);
@@ -82,12 +86,20 @@ public:
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+    llama_paged_block_manager * get_block_manager() const;
+    llama_paged_kv_pool * get_paged_pool() const;
+
+    void set_force_split_seq(bool v) override { force_split_seq = v; }
 
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    const std::unique_ptr<llama_paged_block_manager> block_manager;
+    const std::unique_ptr<llama_paged_kv_pool> paged_pool;
+
+    bool force_split_seq = false;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -110,7 +122,8 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+        std::vector<std::vector<std::pair<int, size_t>>> block_requests);
 
     ~llama_memory_hybrid_context() = default;
 
@@ -120,12 +133,18 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // TurboQuant: delegate to the KV cache context
+    ggml_tensor * get_turbo_rot_forward() const override;
+    ggml_tensor * get_turbo_rot_inverse() const override;
+
     //
     // llama_memory_hybrid_context
     //
 
     const llama_kv_cache_context * get_attn() const;
     const llama_memory_recurrent_context * get_recr() const;
+    const llama_paged_kv_pool * get_paged_pool() const;
+    const llama_paged_kv_metadata * get_paged_metadata() const;
 
 private:
     // the index of the next ubatch to process
@@ -135,6 +154,13 @@ private:
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+
+    llama_paged_block_manager * block_manager = nullptr;
+    llama_paged_kv_pool * paged_pool = nullptr;
+    std::vector<std::vector<std::pair<int, size_t>>> block_requests;
+    std::vector<llama_paged_kv_metadata> paged_metadata;
+
+    bool build_paged_metadata();
 
     const llama_memory_status status;
 };

@@ -140,6 +140,32 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret);
 
+    llm_graph_result * process_ubatch_pipeline(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret,
+                           uint32_t   lane);
+
+    struct prepared_ubatch {
+        llm_graph_result * result = nullptr;
+        ggml_backend_sched_t sched = nullptr;
+        bool batched = false;
+        bool reused = false;
+        int n_splits = 0;
+        int stage0_split_end = 0;
+    };
+
+    bool prepare_ubatch_pipeline(
+                const llama_ubatch & ubatch,
+                    llm_graph_type   gtype,
+            llama_memory_context_i * mctx,
+                       ggml_status & ret,
+                           uint32_t   lane,
+                    prepared_ubatch & prepared);
+    ggml_status submit_prepared_ubatch(const prepared_ubatch & prepared);
+    ggml_status submit_prepared_ubatch_range(const prepared_ubatch & prepared, int split_begin, int split_end);
+
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
@@ -185,6 +211,10 @@ struct llama_context {
     //
 
     llama_perf_context_data perf_get_data() const;
+    llama_graph_stats graph_stats() const;
+    llama_output_transfer_stats output_transfer_stats() const;
+    llama_pipeline_transfer_stats pipeline_transfer_stats() const;
+    void pipeline_timeline_reset();
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
@@ -246,6 +276,8 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute_split_range(ggml_backend_sched_t sched, int split_begin, int split_end, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -342,6 +374,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_pipeline;
 
     bool sched_need_reserve = true;
 
@@ -365,6 +398,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_pipeline;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
@@ -377,6 +411,7 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    bool pipeline_force_sequential = false;
 
     // perf
     mutable int64_t t_start_us  = 0;
@@ -391,4 +426,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    uint64_t raw_logits_host_bytes = 0;
+    uint64_t sampled_output_host_bytes = 0;
+    uint32_t pipeline_microbatch_size = 0;
 };

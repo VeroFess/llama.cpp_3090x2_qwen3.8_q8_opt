@@ -689,6 +689,46 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    [GGML_TYPE_TURBO3_0] = {
+        .type_name                = "turbo3",
+        .blck_size                = QK_TURBO3,
+        .type_size                = sizeof(block_turbo3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .type_name                = "turbo4",
+        .blck_size                = QK_TURBO4,
+        .type_size                = sizeof(block_turbo4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .type_name                = "turbo2",
+        .blck_size                = QK_TURBO2,
+        .type_size                = sizeof(block_turbo2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+    },
+    [GGML_TYPE_TURBO3_TCQ] = {
+        .type_name                = "turbo3_tcq",
+        .blck_size                = QK_TURBO3_TCQ,
+        .type_size                = sizeof(block_turbo3_tcq),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_tcq,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_tcq_ref,
+    },
+    [GGML_TYPE_TURBO2_TCQ] = {
+        .type_name                = "turbo2_tcq",
+        .blck_size                = QK_TURBO2_TCQ,
+        .type_size                = sizeof(block_turbo2_tcq),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_tcq,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_tcq_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1083,6 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "QWEN38_PAGED_ATTN",
 
     "UNARY",
 
@@ -1100,7 +1141,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "qwen38_paged_attn(q, k, v, cache, pages)",
 
     "unary(x)",
 
@@ -1215,7 +1257,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6350,6 +6392,55 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
+struct ggml_tensor * ggml_qwen38_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_new,
+        struct ggml_tensor  * v_new,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * write_slots,
+        struct ggml_tensor  * context_lens,
+        struct ggml_tensor  * batch_offsets,
+        struct ggml_tensor  * batch_lens,
+        float                 scale,
+        int32_t               block_size,
+        int32_t               max_blocks,
+        int32_t               partitions) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_new->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_new->type == GGML_TYPE_F32);
+    GGML_ASSERT(kv_cache->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(block_table->type == GGML_TYPE_I32);
+    GGML_ASSERT(write_slots->type == GGML_TYPE_I32);
+    GGML_ASSERT(context_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(batch_offsets->type == GGML_TYPE_I32);
+    GGML_ASSERT(batch_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k_new->ne[0] && k_new->ne[0] == v_new->ne[0]);
+    GGML_ASSERT(k_new->ne[1] == v_new->ne[1]);
+    GGML_ASSERT(q->ne[2] == k_new->ne[2] && k_new->ne[2] == v_new->ne[2]);
+    GGML_ASSERT(block_size > 0 && max_blocks > 0 && partitions > 0);
+
+    const int64_t output_elements = ggml_nelements(q);
+    const int64_t scratch_elements = partitions > 1 ? (q->ne[0] + 2) * q->ne[1] * q->ne[2] * partitions : 0;
+    struct ggml_tensor * workspace = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, output_elements + scratch_elements);
+    workspace->op = GGML_OP_QWEN38_PAGED_ATTN;
+    workspace->src[0] = q;
+    workspace->src[1] = k_new;
+    workspace->src[2] = v_new;
+    workspace->src[3] = kv_cache;
+    workspace->src[4] = block_table;
+    workspace->src[5] = write_slots;
+    workspace->src[6] = context_lens;
+    workspace->src[7] = batch_offsets;
+    workspace->src[8] = batch_lens;
+    ggml_set_op_params_f32(workspace, 0, scale);
+    ggml_set_op_params_i32(workspace, 1, block_size);
+    ggml_set_op_params_i32(workspace, 2, max_blocks);
+    ggml_set_op_params_i32(workspace, 3, partitions);
+    return ggml_view_3d(ctx, workspace, q->ne[0], q->ne[1], q->ne[2], q->ne[0] * sizeof(float), q->ne[0] * q->ne[1] * sizeof(float), 0);
+}
+
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
@@ -7376,6 +7467,9 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.backend_sched_id       =*/ 0,
+        /*.backend_sched_copy_id  =*/ 0,
+        /*.backend_sched_split_id =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7403,7 +7497,10 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.backend_sched_id       =*/ cgraph0->backend_sched_id,
+        /*.backend_sched_copy_id  =*/ cgraph0->backend_sched_copy_id,
+        /*.backend_sched_split_id =*/ cgraph0->backend_sched_split_id,
     };
 
     return cgraph;
@@ -7417,6 +7514,9 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+    dst->backend_sched_id = src->backend_sched_id;
+    dst->backend_sched_copy_id = src->backend_sched_copy_id;
+    dst->backend_sched_split_id = src->backend_sched_split_id;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];
@@ -7954,6 +8054,11 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_0: result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_0: result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_TCQ: result = quantize_turbo3_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO2_TCQ: result = quantize_turbo2_tcq(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

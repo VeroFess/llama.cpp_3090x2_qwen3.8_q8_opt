@@ -3,6 +3,7 @@
 *.a
 *.bat
 *.bin
+!codebooks/**/*.bin
 *.d
 *.dll
 *.dot

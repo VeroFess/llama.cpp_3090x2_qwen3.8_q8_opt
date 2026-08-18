@@ -106,6 +106,7 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+    list(FILTER SRCS EXCLUDE REGEX "fattn-mma-turbo")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
@@ -117,11 +118,20 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
     else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
+        file(GLOB   SRCS "template-instances/fattn-vec*q4_0-q4_0.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*q8_0-q8_0.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*f16-f16.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*bf16-bf16.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
     ggml_add_backend_library(ggml-cuda

@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
@@ -172,7 +173,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp, cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -256,7 +257,7 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
-        llm_graph_input_attn_kv * inp,
+        llm_graph_input_mem_hybrid * inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
@@ -319,9 +320,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (inp->get_paged()) {
+        auto * paged = inp->get_paged();
+        const llama_paged_kv_pool * pool = paged->mctx->get_paged_pool();
+        const uint32_t device = pool->device_index(il);
+        Qcur = ggml_cont(ctx0, Qcur);
+        Kcur = ggml_cont(ctx0, Kcur);
+        Vcur = ggml_cont(ctx0, Vcur);
+        const llama_paged_kv_metadata * metadata = paged->mctx->get_paged_metadata();
+        int32_t context_tokens = static_cast<int32_t>(pool->n_pages() * pool->page_size());
+        if (metadata && !metadata->context_lens.empty()) {
+            context_tokens = *std::max_element(metadata->context_lens.begin(), metadata->context_lens.end());
+        }
+        const int32_t partitions = context_tokens <= 4096 ? 1 : context_tokens <= 32768 ? 4 : context_tokens <= 131072 ? 8 : 16;
+        cur = ggml_qwen38_paged_attn(
+            ctx0, Qcur, Kcur, Vcur, pool->get_kv(il),
+            paged->block_tables[device], paged->write_slots[device], paged->context_lens,
+            paged->batch_offsets, paged->batch_lens, kq_scale, pool->page_size(), paged->block_tables[device]->ne[0], partitions);
+        cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
+    } else {
+        cur = build_attn(inp->get_attn(),
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

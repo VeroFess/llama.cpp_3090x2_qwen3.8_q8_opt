@@ -390,7 +390,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         float amax = fabsf(xi);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, WARP_SIZE));
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFULL, amax, mask, WARP_SIZE));
         }
 
         const uint8_t e = compute_e8m0_scale(amax);
@@ -400,10 +400,10 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #if CUDART_VERSION >= 12080
         const float scaled_val = xi * inv_s;
 
-        const float val0 = __shfl_sync(0xFFFFFFFF, scaled_val, base, WARP_SIZE);
-        const float val1 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 16, WARP_SIZE);
-        const float val2 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 1, WARP_SIZE);
-        const float val3 = __shfl_sync(0xFFFFFFFF, scaled_val, base + 17, WARP_SIZE);
+        const float val0 = __shfl_sync(0xFFFFFFFFULL, scaled_val, base, WARP_SIZE);
+        const float val1 = __shfl_sync(0xFFFFFFFFULL, scaled_val, base + 16, WARP_SIZE);
+        const float val2 = __shfl_sync(0xFFFFFFFFULL, scaled_val, base + 1, WARP_SIZE);
+        const float val3 = __shfl_sync(0xFFFFFFFFULL, scaled_val, base + 17, WARP_SIZE);
 
         __nv_fp4x4_e2m1 fp4_packed(make_float4(val0, val1, val2, val3));
         packed[b] = *(char2 *) &fp4_packed;
@@ -411,10 +411,10 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         // Fallback: manual FP4 conversion using LUT
         const uint8_t q_val = ggml_cuda_float_to_fp4_e2m1(xi, inv_s);
 
-        const uint8_t q_lo_0 = __shfl_sync(0xFFFFFFFF, q_val, base,      WARP_SIZE);
-        const uint8_t q_lo_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 1,  WARP_SIZE);
-        const uint8_t q_hi_0 = __shfl_sync(0xFFFFFFFF, q_val, base + 16, WARP_SIZE);
-        const uint8_t q_hi_1 = __shfl_sync(0xFFFFFFFF, q_val, base + 17, WARP_SIZE);
+        const uint8_t q_lo_0 = __shfl_sync(0xFFFFFFFFULL, q_val, base,      WARP_SIZE);
+        const uint8_t q_lo_1 = __shfl_sync(0xFFFFFFFFULL, q_val, base + 1,  WARP_SIZE);
+        const uint8_t q_hi_0 = __shfl_sync(0xFFFFFFFFULL, q_val, base + 16, WARP_SIZE);
+        const uint8_t q_hi_1 = __shfl_sync(0xFFFFFFFFULL, q_val, base + 17, WARP_SIZE);
 
         char2 q;
         q.x = (q_hi_0 << 4) | q_lo_0;
@@ -498,7 +498,7 @@ static __global__ void quantize_mmq_q8_1(
     // Exchange max. abs. value between vals_per_scale/4 threads.
 #pragma unroll
     for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFULL, amax, offset, WARP_SIZE));
     }
 
     float sum;
@@ -508,7 +508,7 @@ static __global__ void quantize_mmq_q8_1(
         // Calculate sums across vals_per_sum/4 threads.
 #pragma unroll
         for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+            sum += __shfl_xor_sync(0xFFFFFFFFULL, sum, offset, WARP_SIZE);
         }
     }
 

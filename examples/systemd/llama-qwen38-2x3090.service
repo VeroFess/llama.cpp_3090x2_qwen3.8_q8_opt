@@ -1,0 +1,18 @@
+[Unit]
+Description=Qwen3.8 27B Q8 llama server on two RTX 3090 GPUs
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/llama-qwen38
+Environment=QWEN38_MODEL=/models/Qwen3.8-27B-Q8_0.gguf
+ExecStart=/usr/bin/docker compose -f docker/qwen38-compose.yml up --no-build --abort-on-container-exit
+ExecStop=/usr/bin/docker compose -f docker/qwen38-compose.yml stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+

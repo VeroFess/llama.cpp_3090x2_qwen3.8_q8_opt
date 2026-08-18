@@ -262,12 +262,12 @@ bool llama_batch_allocr::init(
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
             if (batch.token) {
-                if (p0 >= 0 && p0 >= seq_pos_min(s)) {
+                if (p0 >= 0 && p0 > seq_pos_min(s)) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
                             " - the tokens for sequence %d in the input batch have a starting position of Y = %d\n"
-                            " for M-RoPE, it is required that the position satisfies: X < Y\n",
+                            " for M-RoPE, it is required that the position satisfies: X <= Y\n",
                             __func__, s, s, p0, s, seq_pos_min(s));
 
                     return false;
@@ -507,7 +507,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t max_seqs) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -544,7 +544,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
             last_seq_id = batch.seq_id[i][0];
 
-            if (cur_seq_set.size() > n_ubatch) {
+            if (cur_seq_set.size() >= std::max<uint32_t>(1, max_seqs) || cur_seq_set.size() > n_ubatch) {
                 break;
             }
         }

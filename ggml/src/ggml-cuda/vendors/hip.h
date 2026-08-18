@@ -1,6 +1,9 @@
 #pragma once
 
-#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
+// ROCm 7.2+ provides native C++ templates for __shfl_*_sync with default
+// width=warpSize, matching the CUDA API. We rely on those directly — the
+// legacy HIP_DISABLE_WARP_SYNC_BUILTINS guard from older forks conflicts
+// with them and is intentionally omitted here.
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
@@ -29,11 +32,10 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
-#define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
-#define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
+#define cudaMemcpyToSymbol     hipMemcpyToSymbol
+#define cudaMemcpyFromSymbol   hipMemcpyFromSymbol
 #define cublasStrsmBatched hipblasStrsmBatched
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy

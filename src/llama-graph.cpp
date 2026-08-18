@@ -1060,17 +1060,18 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
-
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
-
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+    if (inp_attn) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        if (inp_attn->self_k_rot) {
+            mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+        }
+    } else {
+        inp_paged->set_input(ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1093,10 +1094,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
-
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    if (inp_attn) {
+        res &= mctx->get_attn() != nullptr;
+        res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
+        res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    } else {
+        res &= inp_paged->can_reuse(params);
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1107,6 +1111,29 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
     return res;
+}
+
+void llm_graph_input_attn_qwen38_paged::set_input(const llama_ubatch * /*ubatch*/) {
+    const llama_paged_kv_metadata * metadata = mctx->get_paged_metadata();
+    GGML_ASSERT(metadata != nullptr);
+    for (uint32_t device = 0; device < 2; ++device) {
+        ggml_backend_tensor_set(write_slots[device], metadata->write_slots[device].data(), 0, ggml_nbytes(write_slots[device]));
+        ggml_backend_tensor_set(block_tables[device], metadata->block_tables[device].data(), 0, ggml_nbytes(block_tables[device]));
+    }
+    ggml_backend_tensor_set(context_lens, metadata->context_lens.data(), 0, ggml_nbytes(context_lens));
+    ggml_backend_tensor_set(batch_offsets, metadata->batch_offsets.data(), 0, ggml_nbytes(batch_offsets));
+    ggml_backend_tensor_set(batch_lens, metadata->batch_lens.data(), 0, ggml_nbytes(batch_lens));
+}
+
+bool llm_graph_input_attn_qwen38_paged::can_reuse(const llm_graph_params & params) {
+    const auto * next = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+    const llama_paged_kv_metadata * metadata = next->get_paged_metadata();
+    if (metadata == nullptr) {
+        return false;
+    }
+    mctx = next;
+    return write_slots[0]->ne[0] == static_cast<int64_t>(metadata->write_slots[0].size()) &&
+        block_tables[0]->ne[0] == metadata->max_blocks && block_tables[0]->ne[1] == metadata->n_sequences;
 }
 
 // TODO: Hybrid input classes are a bit redundant.
@@ -3482,9 +3509,31 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+    std::unique_ptr<llm_graph_input_attn_qwen38_paged> inp_paged;
+    if (mctx_cur->get_paged_pool()) {
+        inp_paged = std::make_unique<llm_graph_input_attn_qwen38_paged>(mctx_cur);
+        const llama_paged_kv_metadata * metadata = mctx_cur->get_paged_metadata();
+        const int32_t n_tokens_paged = metadata ? static_cast<int32_t>(metadata->write_slots[0].size()) : static_cast<int32_t>(ubatch.n_tokens);
+        const int32_t n_sequences = metadata ? metadata->n_sequences : std::max<int32_t>(1, ubatch.n_seqs_unq);
+        const int32_t max_blocks = metadata ? metadata->max_blocks : static_cast<int32_t>(mctx_cur->get_paged_pool()->n_pages());
+        for (uint32_t device = 0; device < 2; ++device) {
+            inp_paged->write_slots[device] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens_paged);
+            inp_paged->block_tables[device] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, max_blocks, n_sequences);
+            ggml_set_input(inp_paged->write_slots[device]);
+            ggml_set_input(inp_paged->block_tables[device]);
+        }
+        inp_paged->context_lens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_sequences);
+        inp_paged->batch_offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_sequences);
+        inp_paged->batch_lens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_sequences);
+        ggml_set_input(inp_paged->context_lens);
+        ggml_set_input(inp_paged->batch_offsets);
+        ggml_set_input(inp_paged->batch_lens);
+    } else {
+        inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    }
 
-    auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_paged), std::move(inp_rs), mctx_cur);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
 }

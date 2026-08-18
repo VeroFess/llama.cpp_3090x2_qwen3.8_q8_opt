@@ -1788,6 +1788,136 @@ static void test_tools_oaicompat_json_conversion() {
                   common_chat_tools_to_json_oaicompat({ special_function_tool }).dump(2));
 }
 
+static void test_qwen38_tool_argument_normalization() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/Qwen3.8-27B.jinja");
+    auto render = [&](const json & arguments) {
+        json messages = json::array({
+            {{"role", "user"}, {"content", "Run the function"}},
+            {
+                {"role", "assistant"},
+                {"content", ""},
+                {"tool_calls", json::array({{
+                    {"id", "call_1"},
+                    {"type", "function"},
+                    {"function", {{"name", "special_function"}, {"arguments", arguments}}},
+                }})},
+            },
+        });
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(messages);
+        inputs.tools = { special_function_tool };
+        inputs.add_generation_prompt = false;
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+    };
+
+    const std::string object_prompt = render(json::parse(R"({"arg1":42})"));
+    const std::string string_prompt = render(R"({"arg1":42})");
+    assert_equals(object_prompt, string_prompt);
+    assert_contains(object_prompt, "<parameter=arg1>\n42\n</parameter>");
+
+    const std::string unicode_value = json::parse(R"("\u4f60\u597d")").get<std::string>();
+    const std::string escaped_value = "C:\\repo\\\"quoted\"\nline";
+    const json complex_arguments = {
+        {"arg1", 42},
+        {"text", unicode_value},
+        {"path", escaped_value},
+    };
+    const std::string complex_object_prompt = render(complex_arguments);
+    const std::string complex_string_prompt = render(complex_arguments.dump());
+    assert_equals(complex_object_prompt, complex_string_prompt);
+    assert_contains(complex_object_prompt, "<parameter=text>\n" + unicode_value + "\n</parameter>");
+    assert_contains(complex_object_prompt, "<parameter=path>\n" + escaped_value + "\n</parameter>");
+
+    bool malformed_rejected = false;
+    try {
+        (void) render("{not json}");
+    } catch (const std::invalid_argument &) {
+        malformed_rejected = true;
+    }
+    assert_equals(true, malformed_rejected);
+
+    bool non_object_rejected = false;
+    try {
+        (void) render("[1,2,3]");
+    } catch (const std::invalid_argument &) {
+        non_object_rejected = true;
+    }
+    assert_equals(true, non_object_rejected);
+}
+
+static void test_qwen38_multistep_tool_history() {
+    LOG_DBG("%s\n", __func__);
+
+    auto tmpls = read_templates("models/templates/Qwen3.8-27B.jinja");
+    const std::string unicode_result = json::parse(R"("\u5de5\u5177\u7ed3\u679c")").get<std::string>();
+    const json messages = json::array({
+        {{"role", "user"}, {"content", "Inspect the repository"}},
+        {
+            {"role", "assistant"},
+            {"content", ""},
+            {"reasoning_content", "reason-one"},
+            {"tool_calls", json::array({
+                {
+                    {"id", "call_1"},
+                    {"type", "function"},
+                    {"function", {{"name", "special_function"}, {"arguments", {{"arg1", 1}}}}},
+                },
+                {
+                    {"id", "call_2"},
+                    {"type", "function"},
+                    {"function", {{"name", "special_function_with_opt"}, {"arguments", {{"arg1", 2}, {"arg2", 3}}}}},
+                },
+            })},
+        },
+        {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "first-result"}},
+        {{"role", "tool"}, {"tool_call_id", "call_2"}, {"content", unicode_result}},
+        {
+            {"role", "assistant"},
+            {"content", ""},
+            {"reasoning_content", "reason-two"},
+            {"tool_calls", json::array({{
+                {"id", "call_3"},
+                {"type", "function"},
+                {"function", {{"name", "special_function"}, {"arguments", R"({"arg1":4})"}}},
+            }})},
+        },
+        {{"role", "tool"}, {"tool_call_id", "call_3"}, {"content", "third-result\nwith-escape"}},
+        {{"role", "user"}, {"content", "Continue"}},
+    });
+
+    auto render = [&](bool preserve_thinking) {
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(messages);
+        inputs.tools = { special_function_tool, special_function_tool_with_optional_param };
+        inputs.parallel_tool_calls = true;
+        inputs.add_generation_prompt = false;
+        inputs.chat_template_kwargs["preserve_thinking"] = preserve_thinking ? "true" : "false";
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt;
+    };
+
+    const std::string preserved = render(true);
+    const size_t reason_one = preserved.find("reason-one");
+    const size_t first_call = preserved.find("<function=special_function>", reason_one);
+    const size_t first_result = preserved.find("first-result", first_call);
+    const size_t reason_two = preserved.find("reason-two", first_result);
+    const size_t third_call = preserved.find("<function=special_function>", reason_two);
+    const size_t third_result = preserved.find("third-result\nwith-escape", third_call);
+    const size_t continuation = preserved.find("Continue", third_result);
+    assert_equals(true, reason_one < first_call && first_call < first_result && first_result < reason_two &&
+        reason_two < third_call && third_call < third_result && third_result < continuation);
+    assert_contains(preserved, "<function=special_function_with_opt>");
+    assert_contains(preserved, unicode_result);
+
+    const std::string dropped = render(false);
+    assert_not_contains(dropped, "reason-one");
+    assert_not_contains(dropped, "reason-two");
+    assert_contains(dropped, "first-result");
+    assert_contains(dropped, "third-result\nwith-escape");
+}
+
 static void test_convert_responses_to_chatcmpl() {
     LOG_DBG("%s\n", __func__);
 
@@ -1974,6 +2104,71 @@ static void test_convert_responses_to_chatcmpl() {
 
         assert_equals(false, result.contains("tools"));
     }
+}
+
+static void test_responses_previous_response_id() {
+    LOG_DBG("%s\n", __func__);
+
+    json first_messages = json::array({
+        {{"role", "system"}, {"content", "old instructions"}},
+        {{"role", "user"}, {"content", "first"}},
+    });
+    const std::string response_id = server_responses_history_begin(first_messages);
+
+    common_chat_msg response;
+    response.role = "assistant";
+    response.content = "answer";
+    response.reasoning_content = "stored reasoning";
+    server_responses_history_complete(response_id, response);
+
+    const json converted = server_chat_convert_responses_to_chatcmpl({
+        {"input", "next"},
+        {"previous_response_id", response_id},
+    });
+    const json & messages = converted.at("messages");
+    assert_equals((size_t) 4, messages.size());
+    assert_equals(std::string("old instructions"), messages[0].at("content").get<std::string>());
+    assert_equals(std::string("first"), messages[1].at("content").get<std::string>());
+    assert_equals(std::string("answer"), messages[2].at("content").get<std::string>());
+    assert_equals(std::string("stored reasoning"), messages[2].at("reasoning_content").get<std::string>());
+    assert_equals(std::string("next"), messages[3].at("content").get<std::string>());
+
+    const json with_new_instructions = server_chat_convert_responses_to_chatcmpl({
+        {"instructions", "new instructions"},
+        {"input", "next"},
+        {"previous_response_id", response_id},
+    });
+    const json & replaced_messages = with_new_instructions.at("messages");
+    assert_equals((size_t) 4, replaced_messages.size());
+    assert_equals(std::string("new instructions"), replaced_messages[0].at("content").get<std::string>());
+    assert_equals(std::string("first"), replaced_messages[1].at("content").get<std::string>());
+    assert_equals(std::string("answer"), replaced_messages[2].at("content").get<std::string>());
+    assert_equals(std::string("next"), replaced_messages[3].at("content").get<std::string>());
+
+    const std::string incomplete_id = server_responses_history_begin(json::array({
+        {{"role", "user"}, {"content", "incomplete"}},
+    }));
+    bool incomplete_rejected = false;
+    try {
+        (void) server_chat_convert_responses_to_chatcmpl({
+            {"input", "next"},
+            {"previous_response_id", incomplete_id},
+        });
+    } catch (const std::invalid_argument &) {
+        incomplete_rejected = true;
+    }
+    assert_equals(true, incomplete_rejected);
+
+    bool unknown_rejected = false;
+    try {
+        (void) server_chat_convert_responses_to_chatcmpl({
+            {"input", "next"},
+            {"previous_response_id", "resp_missing"},
+        });
+    } catch (const std::invalid_argument &) {
+        unknown_rejected = true;
+    }
+    assert_equals(true, unknown_rejected);
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser
@@ -2560,6 +2755,42 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 })
                 .run();
         }
+    }
+
+    {
+        auto tst = peg_tester("models/templates/Qwen3.8-27B.jinja", detailed_debug);
+        const std::string unicode_code = "print(\"quoted\")\n" +
+            json::parse(R"("\u4f60\u597d")").get<std::string>();
+        const std::string input =
+            "Inspect both calls.\n"
+            "</think>\n\n"
+            "<tool_call>\n"
+            "<function=special_function>\n"
+            "<parameter=arg1>\n1\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "<tool_call>\n"
+            "<function=python>\n"
+            "<parameter=code>\n" + unicode_code + "\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>";
+
+        common_chat_msg expected;
+        expected.role = "assistant";
+        expected.reasoning_content = "Inspect both calls.";
+        expected.tool_calls = {
+            { "special_function", R"({"arg1": 1})", {} },
+            { "python", json({{"code", unicode_code}}).dump(), {} },
+        };
+
+        tst.test(input)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, python_tool })
+            .expect(expected)
+            .expect_reconstruction()
+            .run();
     }
 
     {
@@ -7230,7 +7461,10 @@ int main(int argc, char ** argv) {
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
+        test_qwen38_tool_argument_normalization();
+        test_qwen38_multistep_tool_history();
         test_convert_responses_to_chatcmpl();
+        test_responses_previous_response_id();
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();

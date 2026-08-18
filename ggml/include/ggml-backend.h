@@ -25,6 +25,37 @@ extern "C" {
     typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
     typedef struct ggml_backend_event * ggml_backend_event_t;
     typedef struct ggml_backend * ggml_backend_t;
+
+struct ggml_backend_graph_stats {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t captures;
+    uint64_t fallbacks;
+    uint64_t cache_entries;
+    uint64_t capture_us;
+};
+
+struct ggml_backend_transfer_stats {
+    int32_t device;
+    uint64_t host_staged_transfers;
+    uint64_t host_staged_d2h_bytes;
+    uint64_t host_staged_h2d_bytes;
+    uint64_t direct_peer_transfers;
+    uint64_t compute_us;
+    uint64_t d2h_us;
+    uint64_t h2d_us;
+    uint64_t host_staging_wait_us;
+    uint64_t window_us;
+    uint64_t timing_drops;
+};
+
+struct ggml_backend_pipeline_timeline_stats {
+    uint64_t stage0_busy_us;
+    uint64_t stage1_busy_us;
+    uint64_t overlap_us;
+    uint64_t span_us;
+    uint64_t dropped_intervals;
+};
     typedef void * ggml_backend_graph_plan_t;
     typedef struct ggml_backend_reg * ggml_backend_reg_t;
     typedef struct ggml_backend_device * ggml_backend_dev_t;
@@ -328,7 +359,10 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+    GGML_API ggml_backend_t       ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_set_stable_split_inputs(ggml_backend_sched_t sched, bool enabled);
+    GGML_API uint64_t             ggml_backend_sched_get_activation_buffer_wait_us(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -343,7 +377,9 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_split_range(ggml_backend_sched_t sched, int split_begin, int split_end);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_synchronize_current(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

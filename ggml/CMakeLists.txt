@@ -208,6 +208,15 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+option(GGML_QWEN38_2X3090                   "ggml: build the Qwen3.8 27B dual RTX 3090 profile" OFF)
+
+if (GGML_QWEN38_2X3090)
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "GGML_QWEN38_2X3090 requires GGML_CUDA")
+    endif()
+    set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
+    add_compile_definitions(GGML_QWEN38_2X3090)
+endif()
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")

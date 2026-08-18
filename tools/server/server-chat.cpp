@@ -1,19 +1,78 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
+
+struct server_response_history_entry {
+    json messages;
+    int64_t touched_ms = 0;
+    bool complete = false;
+};
+
+static std::mutex response_history_mutex;
+static std::unordered_map<std::string, server_response_history_entry> response_history;
+static constexpr size_t RESPONSE_HISTORY_LIMIT = 256;
+
+static json server_responses_history_get(const std::string & response_id) {
+    std::lock_guard<std::mutex> lock(response_history_mutex);
+    const auto it = response_history.find(response_id);
+    if (it == response_history.end() || !it->second.complete) {
+        throw std::invalid_argument("unknown or incomplete previous_response_id: " + response_id);
+    }
+    it->second.touched_ms = ggml_time_ms();
+    return it->second.messages;
+}
+
+std::string server_responses_history_begin(const json & messages) {
+    if (!messages.is_array()) {
+        throw std::invalid_argument("response history messages must be an array");
+    }
+
+    std::lock_guard<std::mutex> lock(response_history_mutex);
+    if (response_history.size() >= RESPONSE_HISTORY_LIMIT) {
+        auto oldest = response_history.begin();
+        for (auto it = response_history.begin(); it != response_history.end(); ++it) {
+            if (it->second.touched_ms < oldest->second.touched_ms) {
+                oldest = it;
+            }
+        }
+        response_history.erase(oldest);
+    }
+
+    const std::string response_id = "resp_" + random_string();
+    response_history[response_id] = {messages, ggml_time_ms(), false};
+    return response_id;
+}
+
+void server_responses_history_complete(const std::string & response_id, const common_chat_msg & response) {
+    if (response_id.empty() || response.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(response_history_mutex);
+    const auto it = response_history.find(response_id);
+    if (it == response_history.end()) {
+        return;
+    }
+    it->second.messages.push_back(response.to_json_oaicompat());
+    it->second.touched_ms = ggml_time_ms();
+    it->second.complete = true;
+}
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
     }
-    if (!json_value(response_body, "previous_response_id", std::string{}).empty()) {
-        throw std::invalid_argument("llama.cpp does not support 'previous_response_id'.");
-    }
+
+    const std::string previous_response_id = json_value(response_body, "previous_response_id", std::string{});
+    const json previous_messages = previous_response_id.empty() ? json::array() : server_responses_history_get(previous_response_id);
 
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
+    chatcmpl_body.erase("previous_response_id");
     std::vector<json> chatcmpl_messages;
 
     if (response_body.contains("instructions")) {
@@ -22,6 +81,14 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             {"content", json_value(response_body, "instructions", std::string())},
         });
         chatcmpl_body.erase("instructions");
+    }
+
+    for (const auto & message : previous_messages) {
+        const std::string role = json_value(message, "role", std::string());
+        if (response_body.contains("instructions") && (role == "system" || role == "developer")) {
+            continue;
+        }
+        chatcmpl_messages.push_back(message);
     }
 
     if (input_value.is_string()) {

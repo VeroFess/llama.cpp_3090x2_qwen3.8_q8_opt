@@ -493,6 +493,7 @@ struct common_params {
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
+    std::string model_sha256;
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
@@ -613,6 +614,20 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+
+    std::string deployment_profile;
+    bool deployment_profile_applied = false;
+    int32_t max_num_batched_tokens = 0;
+    int32_t gpu_memory_reserve_mib = 0;
+    int32_t kv_page_size = 0;
+    bool kv_paged_storage = false;
+    float scheduler_target_step_ms = 0.0f;
+    std::string autotune_mode = "off";
+    std::string autotune_cache_path;
+    std::string autotune_cache_key_sha256;
+    std::string autotune_model_sha256;
+    bool cuda_p2p_active = false;
+    int32_t qwen38_layer_boundary = -1;
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

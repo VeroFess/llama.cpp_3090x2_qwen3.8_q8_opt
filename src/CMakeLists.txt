@@ -31,6 +31,10 @@ add_library(llama
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
+            llama-paged-block-manager.cpp
+            llama-paged-block-manager.h
+            llama-paged-kv-pool.cpp
+            llama-paged-kv-pool.h
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp

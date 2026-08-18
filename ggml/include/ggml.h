@@ -430,7 +430,12 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO3_0 = 43,
+        GGML_TYPE_TURBO4_0 = 44,
+        GGML_TYPE_TURBO2_0 = 45,
+        GGML_TYPE_TURBO3_TCQ = 46,
+        GGML_TYPE_TURBO2_TCQ = 47,
+        GGML_TYPE_COUNT   = 48,
     };
 
     // precision
@@ -574,6 +579,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_QWEN38_PAGED_ATTN,
 
         GGML_OP_UNARY,
 
@@ -2601,6 +2607,22 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    GGML_API struct ggml_tensor * ggml_qwen38_paged_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_new,
+        struct ggml_tensor  * v_new,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * block_table,
+        struct ggml_tensor  * write_slots,
+        struct ggml_tensor  * context_lens,
+        struct ggml_tensor  * batch_offsets,
+        struct ggml_tensor  * batch_lens,
+        float                 scale,
+        int32_t               block_size,
+        int32_t               max_blocks,
+        int32_t               partitions);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

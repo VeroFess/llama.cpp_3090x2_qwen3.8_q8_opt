@@ -90,6 +90,69 @@
     { "name": "x64-windows-sycl-release-f16", "inherits": [ "sycl-base", "release", "sycl_f16" ] },
 
     { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
-    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] },
+
+    {
+        "name": "qwen38-3090-release",
+        "inherits": [ "base", "x64-linux-gcc", "release" ],
+        "binaryDir": "${sourceDir}/build-qwen38-3090",
+        "cacheVariables": {
+            "BUILD_SHARED_LIBS": "OFF",
+            "CMAKE_CUDA_ARCHITECTURES": "86",
+            "GGML_CUDA": "ON",
+            "GGML_CUDA_FA": "ON",
+            "GGML_CUDA_FA_ALL_QUANTS": "ON",
+            "GGML_CUDA_GRAPHS": "ON",
+            "GGML_CUDA_NCCL": "OFF",
+            "GGML_NATIVE": "ON",
+            "GGML_QWEN38_2X3090": "ON",
+            "LLAMA_BUILD_SERVER": "ON",
+            "LLAMA_BUILD_TESTS": "ON"
+        }
+    },
+    {
+        "name": "qwen38-3090-debug",
+        "inherits": [ "base", "x64-linux-gcc", "debug" ],
+        "binaryDir": "${sourceDir}/build-qwen38-3090-debug",
+        "cacheVariables": {
+            "BUILD_SHARED_LIBS": "OFF",
+            "CMAKE_CUDA_ARCHITECTURES": "86",
+            "GGML_CUDA": "ON",
+            "GGML_CUDA_FA": "ON",
+            "GGML_CUDA_FA_ALL_QUANTS": "OFF",
+            "GGML_CUDA_GRAPHS": "ON",
+            "GGML_CUDA_NCCL": "OFF",
+            "GGML_NATIVE": "ON",
+            "GGML_QWEN38_2X3090": "ON",
+            "LLAMA_BUILD_SERVER": "ON",
+            "LLAMA_BUILD_TESTS": "ON"
+        }
+    },
+    {
+        "name": "qwen38-3090-asan-ubsan",
+        "inherits": [ "qwen38-3090-debug" ],
+        "binaryDir": "${sourceDir}/build-qwen38-3090-asan-ubsan",
+        "cacheVariables": {
+            "GGML_SANITIZE_ADDRESS": "ON",
+            "GGML_SANITIZE_UNDEFINED": "ON"
+        }
+    }
+  ],
+  "buildPresets": [
+    { "name": "qwen38-3090-release", "configurePreset": "qwen38-3090-release" },
+    { "name": "qwen38-3090-debug", "configurePreset": "qwen38-3090-debug" },
+    { "name": "qwen38-3090-asan-ubsan", "configurePreset": "qwen38-3090-asan-ubsan" }
+  ],
+  "testPresets": [
+    {
+        "name": "qwen38-3090-release",
+        "configurePreset": "qwen38-3090-release",
+        "output": { "outputOnFailure": true }
+    },
+    {
+        "name": "qwen38-3090-debug",
+        "configurePreset": "qwen38-3090-debug",
+        "output": { "outputOnFailure": true }
+    }
   ]
 }

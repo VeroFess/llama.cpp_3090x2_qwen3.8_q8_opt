@@ -409,6 +409,31 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_TCQ] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_tcq_ref,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_TCQ] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_tcq_ref,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
@@ -2076,6 +2101,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_QWEN38_PAGED_ATTN:
+            {
+                GGML_ABORT("Qwen3.8 paged attention requires CUDA");
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2400,6 +2429,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_QWEN38_PAGED_ATTN:
             {
                 n_tasks = n_threads;
             } break;

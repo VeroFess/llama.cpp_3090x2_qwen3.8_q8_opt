@@ -36,6 +36,23 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+GGML_BACKEND_API int  ggml_backend_cuda_get_device_compute_capability(int device);
+GGML_BACKEND_API bool ggml_backend_cuda_can_access_peer(int src_device, int dst_device);
+GGML_BACKEND_API bool ggml_backend_cuda_enable_peer_access(int src_device, int dst_device);
+
+GGML_BACKEND_API bool ggml_backend_cuda_get_graph_stats(
+                    ggml_backend_t backend,
+        struct ggml_backend_graph_stats * stats);
+
+GGML_BACKEND_API bool ggml_backend_cuda_get_transfer_stats(
+                    ggml_backend_t backend,
+        struct ggml_backend_transfer_stats * stats);
+
+GGML_BACKEND_API bool ggml_backend_cuda_get_pipeline_timeline_stats(
+                    ggml_backend_t backend,
+        struct ggml_backend_pipeline_timeline_stats * stats);
+GGML_BACKEND_API void ggml_backend_cuda_reset_pipeline_timeline(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_cuda_set_pipeline_timeline_group(ggml_backend_t backend, uint64_t group);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

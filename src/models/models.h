@@ -56,6 +56,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    // fused op with keep_intermediates=true: returns the raw [attn | T snapshots]
+    // output tensor. Caller slices snapshot views and routes them to recurrent slots.
+    ggml_tensor * build_delta_net_fused_keep_intermediates(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * s,
+                        int   il);
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
@@ -596,6 +607,11 @@ struct llama_model_qwen3vl : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llm_build_dflash_draft : public llm_graph_context {
+    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
 };
 
 
@@ -2191,7 +2207,7 @@ struct llama_model_qwen35 : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
         ggml_tensor * build_layer_attn(
-        llm_graph_input_attn_kv * inp_attn,
+        llm_graph_input_mem_hybrid * inp,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,

@@ -389,6 +389,28 @@ static void test_split(testing & t) {
         t.assert_equal(6u, ba.get_n_used());
     });
 
+    t.test("split_equal_max_sequences", [&](testing & t) {
+        batch_builder bb;
+        for (int seq = 0; seq < 8; ++seq) {
+            bb.add(2 * seq + 0, {seq}, false);
+            bb.add(2 * seq + 1, {seq}, true);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+
+        llama_ubatch ub = ba.split_equal(64, false, 0, 4);
+        t.assert_equal(8u, ub.n_tokens);
+        t.assert_equal(4u, ub.n_seqs);
+        t.assert_equal(4u, ub.n_seqs_unq);
+
+        ub = ba.split_equal(64, false, 0, 4);
+        t.assert_equal(8u, ub.n_tokens);
+        t.assert_equal(4u, ub.n_seqs);
+        t.assert_equal(4u, ub.n_seqs_unq);
+        t.assert_equal(0u, ba.split_equal(64, false, 0, 4).n_tokens);
+    });
+
     t.test("split_equal_coupled", [&](testing & t) {
         batch_builder bb;
         bb.add(0, {0, 1}, false);

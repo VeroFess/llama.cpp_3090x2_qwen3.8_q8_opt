@@ -1697,6 +1697,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.kv_page_size      = std::max(params.kv_page_size, 0);
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1723,6 +1724,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_paged_storage  = params.kv_paged_storage;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

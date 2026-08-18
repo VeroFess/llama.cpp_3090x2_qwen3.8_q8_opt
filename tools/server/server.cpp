@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-qwen38-profile.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -106,6 +107,14 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
+    {
+        std::string error;
+        if (!server_qwen38_profile_apply(params, error)) {
+            SRV_ERR("profile error: %s\n", error.c_str());
+            return 1;
+        }
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -127,6 +136,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
             }
         } catch (const std::exception & e) {
             SRV_ERR("failed to fetch model metadata: %s\n", e.what());
+            return 1;
+        }
+    }
+
+    {
+        std::string error;
+        if (!server_qwen38_profile_apply(params, error)) {
+            SRV_ERR("profile error: %s\n", error.c_str());
+            return 1;
+        }
+        if (!server_qwen38_profile_validate_hardware(params, error)) {
+            SRV_ERR("profile hardware error: %s\n", error.c_str());
             return 1;
         }
     }
@@ -232,6 +253,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
+    ctx_http.get ("/debug/profile",             ex_wrapper(routes.get_debug_profile));
+    ctx_http.get ("/debug/scheduler",           ex_wrapper(routes.get_debug_scheduler));
+    ctx_http.get ("/debug/graphs",              ex_wrapper(routes.get_debug_graphs));
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));

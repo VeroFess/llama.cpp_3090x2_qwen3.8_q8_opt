@@ -354,6 +354,7 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t kv_page_size;           // logical KV page size for hybrid paged memory (0 = disabled) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -398,6 +399,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_paged_storage; // use block-table-addressed KV storage for supported hybrid models [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -794,6 +796,53 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    struct llama_paged_memory_stats {
+        size_t page_size;
+        size_t total_pages;
+        size_t free_pages;
+        size_t physical_pages[2];
+        size_t free_physical_pages[2];
+        size_t resident_sequences;
+        size_t admitted_pages;
+        size_t committed_pages;
+        size_t cow_pages;
+        size_t allocation_failures;
+        size_t cached_prefixes;
+        size_t cached_prefix_pages;
+    };
+
+    LLAMA_API bool llama_memory_paged_admit(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    size_t max_tokens);
+
+    LLAMA_API void llama_memory_paged_release_admission(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API bool llama_memory_paged_get_stats(
+                         llama_memory_t mem,
+            struct llama_paged_memory_stats * stats);
+
+    LLAMA_API bool llama_memory_paged_prefix_pin(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                    size_t tokens,
+                  uint64_t * prefix_id);
+
+    LLAMA_API bool llama_memory_paged_prefix_attach(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                  uint64_t prefix_id);
+
+    LLAMA_API bool llama_memory_paged_prefix_release(
+            llama_memory_t mem,
+                  uint64_t prefix_id);
+
+    LLAMA_API size_t llama_memory_paged_prefix_tokens(
+            llama_memory_t mem,
+                  uint64_t prefix_id);
 
     //
     // State / sessions
@@ -1580,7 +1629,47 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
+    struct llama_graph_stats {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t captures;
+        uint64_t fallbacks;
+        uint64_t cache_entries;
+        uint64_t capture_us;
+    };
+
+    struct llama_output_transfer_stats {
+        uint64_t raw_logits_bytes;
+        uint64_t sampled_output_bytes;
+    };
+
+    struct llama_pipeline_transfer_stats {
+        uint64_t host_staged_transfers;
+        uint64_t d2h_bytes;
+        uint64_t h2d_bytes;
+        uint64_t direct_peer_transfers;
+        uint64_t stage0_us;
+        uint64_t stage1_us;
+        uint64_t d2h_us;
+        uint64_t h2d_us;
+        uint64_t host_staging_wait_us;
+        uint64_t activation_buffer_wait_us;
+        uint64_t window_us;
+        uint64_t timing_drops;
+        uint32_t microbatch_size;
+        uint64_t timeline_stage0_us;
+        uint64_t timeline_stage1_us;
+        uint64_t timeline_overlap_us;
+        uint64_t timeline_span_us;
+        uint64_t timeline_dropped_intervals;
+        uint32_t pipeline_depth;
+    };
+
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
+    LLAMA_API struct llama_graph_stats        llama_get_graph_stats  (const struct llama_context * ctx);
+    LLAMA_API struct llama_output_transfer_stats llama_get_output_transfer_stats(const struct llama_context * ctx);
+    LLAMA_API struct llama_pipeline_transfer_stats llama_get_pipeline_transfer_stats(const struct llama_context * ctx);
+    LLAMA_API void llama_reset_pipeline_timeline(struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 

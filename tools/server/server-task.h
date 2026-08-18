@@ -10,6 +10,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-prefix-cache-index.h"
 
 using json = nlohmann::ordered_json;
 
@@ -83,6 +84,7 @@ struct task_params {
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
+    std::string        oai_resp_id;
 
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
@@ -123,7 +125,7 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
-    task_result_state(const common_chat_parser_params & chat_parser_params);
+    task_result_state(const common_chat_parser_params & chat_parser_params, const std::string & response_id = {});
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -247,7 +249,7 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+        return task_result_state(params.chat_parser_params, params.oai_resp_id);
     }
 
     bool is_parent() const {
@@ -592,6 +594,12 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    std::string fingerprint;
+    uint64_t paged_prefix_id = 0;
+    uint64_t last_use = 0;
+    uint64_t hits = 0;
+    bool protected_segment = false;
+    uint64_t cache_id = 0;
 
     size_t size() const {
         size_t res = data.size();
@@ -605,10 +613,12 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, llama_memory_t memory, size_t block_size) : memory(memory), index(block_size) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
+
+    ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
 
@@ -618,15 +628,39 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    llama_memory_t memory = nullptr;
+    uint64_t use_clock = 0;
+    uint64_t next_cache_id = 1;
+    uint64_t prefix_hit_tokens = 0;
+    uint64_t prefix_miss_tokens = 0;
+    uint64_t prefix_evictions = 0;
+    server_prefix_cache_index index;
+    std::unordered_map<uint64_t, server_prompt_cache_state *> states_by_id;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(
+            const server_prompt & prompt,
+            size_t state_size_main,
+            size_t state_size_drft,
+            const std::string & fingerprint,
+            uint64_t paged_prefix_id);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(
+            server_prompt & prompt,
+            const server_tokens & tokens_new,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            int32_t id_slot,
+            const std::string & fingerprint);
 
     void update();
+
+private:
+    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
+    bool evict_one();
 };
 
 // used exclusively by router mode

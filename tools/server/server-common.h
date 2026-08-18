@@ -458,6 +458,50 @@ struct server_metrics {
 
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
+    uint64_t kv_prefix_hit_tokens = 0;
+    uint64_t kv_prefix_miss_tokens = 0;
+    uint64_t kv_prefix_evictions = 0;
+    uint64_t scheduler_iteration_count = 0;
+    uint64_t scheduler_iteration_us = 0;
+    uint64_t scheduler_deadline_misses = 0;
+    uint64_t scheduler_prefill_starvation_us = 0;
+    double scheduler_prefill_us_per_token = 0.0;
+    double scheduler_decode_us_per_token = 0.0;
+    uint64_t cuda_graph_hits = 0;
+    uint64_t cuda_graph_misses = 0;
+    uint64_t cuda_graph_captures = 0;
+    uint64_t cuda_graph_fallbacks = 0;
+    uint64_t cuda_graph_cache_entries = 0;
+    uint64_t cuda_graph_capture_us = 0;
+    llama_graph_stats cuda_graph_target = {};
+    llama_graph_stats cuda_graph_draft = {};
+    uint64_t cuda_graph_decode_hits = 0;
+    uint64_t cuda_graph_decode_misses = 0;
+    uint64_t cuda_graph_decode_captures = 0;
+    uint64_t cuda_graph_decode_fallbacks = 0;
+    uint64_t gpu_sampling_tokens = 0;
+    uint64_t gpu_sampling_fallbacks = 0;
+    uint64_t gpu_raw_logits_d2h_bytes = 0;
+    uint64_t gpu_sampled_output_d2h_bytes = 0;
+    uint64_t pipeline_host_staged_transfers = 0;
+    uint64_t pipeline_d2h_bytes = 0;
+    uint64_t pipeline_h2d_bytes = 0;
+    uint64_t pipeline_direct_peer_transfers = 0;
+    uint64_t pipeline_stage0_us = 0;
+    uint64_t pipeline_stage1_us = 0;
+    uint64_t pipeline_d2h_us = 0;
+    uint64_t pipeline_h2d_us = 0;
+    uint64_t pipeline_host_staging_wait_us = 0;
+    uint64_t pipeline_activation_buffer_wait_us = 0;
+    uint64_t pipeline_window_us = 0;
+    uint64_t pipeline_timeline_stage0_us = 0;
+    uint64_t pipeline_timeline_stage1_us = 0;
+    uint64_t pipeline_overlap_us = 0;
+    uint64_t pipeline_timeline_dropped_intervals = 0;
+    uint64_t pipeline_timing_drops = 0;
+    uint32_t pipeline_microbatch_size = 0;
+    uint32_t pipeline_depth = 1;
+    double pipeline_bubble_ratio = 0.0;
 
     uint64_t n_tokens_max = 0;
 

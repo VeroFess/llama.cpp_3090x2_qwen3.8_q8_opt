@@ -12,6 +12,8 @@ using json = nlohmann::ordered_json;
 
 // Convert OpenAI Responses API format to OpenAI Chat Completions API format
 json server_chat_convert_responses_to_chatcmpl(const json & body);
+std::string server_responses_history_begin(const json & messages);
+void server_responses_history_complete(const std::string & response_id, const common_chat_msg & response);
 
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);

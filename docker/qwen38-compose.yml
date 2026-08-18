@@ -1,0 +1,32 @@
+services:
+  llama-qwen38:
+    image: llama-qwen38-2x3090:local
+    build:
+      context: ..
+      dockerfile: docker/qwen38-3090.Dockerfile
+    ports:
+      - "8080:8080"
+    gpus:
+      - driver: nvidia
+        device_ids: ["0", "1"]
+        capabilities: ["gpu"]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0,1"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      CUDA_VISIBLE_DEVICES: "0,1"
+    volumes:
+      - type: bind
+        source: ${QWEN38_MODEL}
+        target: /models/Qwen3.8-27B-Q8_0.gguf
+        read_only: true
+    command:
+      - --model
+      - /models/Qwen3.8-27B-Q8_0.gguf
+      - --profile
+      - qwen38-27b-q8-2x3090
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    restart: unless-stopped
+

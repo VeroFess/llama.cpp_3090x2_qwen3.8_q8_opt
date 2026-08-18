@@ -83,6 +83,7 @@ if (WIN32)
 endif()
 
 if (MSVC)
+    add_compile_definitions(_USE_MATH_DEFINES)
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/bigobj>")
@@ -212,6 +213,10 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     set(GGML_BUILD_COMMIT ${LLAMA_BUILD_COMMIT})
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
+endif()
+
+if (GGML_QWEN38_2X3090)
+    add_compile_definitions(GGML_QWEN38_2X3090)
 endif()
 
 #
