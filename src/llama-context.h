@@ -6,16 +6,13 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
-#include "llama-mtp.h"
+#include "llama-memory.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
-#include <unordered_map>
 #include <vector>
-
-struct llama_memory_recurrent;
 
 struct llama_model;
 class llama_batch_allocr;
@@ -26,147 +23,6 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
-
-// DFlash: hidden state buffer for captured layer activations
-struct dflash_layer_hidden_buf {
-    std::vector<float> data;
-    int64_t n_embd = 0;
-    int64_t n_tokens = 0;
-};
-
-// DFlash: tape recording data for one recurrent layer
-struct dflash_tape_layer {
-    std::vector<float> k;          // [S_k * H_k * n_tokens] after l2_norm
-    std::vector<float> v;          // [S_v * H_v * n_tokens]
-    std::vector<float> gate;       // [H_v * n_tokens] pre-exp
-    std::vector<float> beta;       // [H_v * n_tokens] pre-sigmoid
-    std::vector<float> qkv_mixed;  // [conv_channels * n_tokens * n_seqs] for conv state rebuild
-    int64_t S_k = 0, H_k = 0, S_v = 0, H_v = 0;
-    int64_t conv_channels = 0;
-    int n_tokens = 0;
-    // per-seq metadata for multi-seq verify QKV scatter
-    int n_seqs = 1;
-    llama_seq_id seq_ids[LLAMA_DFLASH_MAX_SLOTS] = {};
-};
-
-// GPU-resident tape: persistent tensors that the graph writes into directly (no eval callback sync)
-struct dflash_tape_gpu_layer {
-    ggml_tensor * k    = nullptr;  // [S_k, H_k, max_tokens]
-    ggml_tensor * v    = nullptr;  // [S_v, H_v, max_tokens]
-    ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
-    ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_context * ctx = nullptr;
-    ggml_backend_t backend = nullptr;
-};
-
-struct dflash_tape_gpu {
-    std::vector<dflash_tape_gpu_layer> layers;  // one per recurrent layer
-    std::vector<int32_t> layer_ids;             // model layer indices → tape index mapping
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_context * ctx = nullptr;               // owns the tensor descriptors
-    int max_tokens = 0;                         // allocated capacity
-    int n_tokens = 0;                           // actual tokens recorded this pass
-
-    ~dflash_tape_gpu() {
-        for (auto & layer : layers) {
-            if (layer.buf) ggml_backend_buffer_free(layer.buf);
-            if (layer.ctx) ggml_free(layer.ctx);
-        }
-        if (buf) ggml_backend_buffer_free(buf);
-        if (ctx) ggml_free(ctx);
-    }
-};
-
-enum dflash_tape_type {
-    DFLASH_TAPE_K    = 0,
-    DFLASH_TAPE_V    = 1,
-    DFLASH_TAPE_GATE = 2,
-    DFLASH_TAPE_BETA = 3,
-    DFLASH_TAPE_QKV  = 4,
-};
-
-// DDTree: tree attention mask for verification
-struct llama_tree_mask {
-    bool active = false;
-    int n_tree_tokens = 0;         // number of tree tokens (root + nodes)
-    std::vector<uint8_t> visibility;  // [n² row-major] true = can attend
-};
-
-// DFlash: eval callback data for hidden state capture + tape recording
-struct dflash_capture_data {
-    // hidden state capture (for drafter conditioning)
-    std::vector<int32_t> layer_ids;           // layer indices to capture
-    std::vector<std::string> tensor_names;    // pre-formatted "l_out-{id}" names
-    std::unordered_map<std::string, size_t> hidden_name_idx; // name → index for O(1) lookup
-    // pointer to context's layer_hiddens (outer: per-slot, inner: per-captured-layer)
-    std::vector<std::vector<dflash_layer_hidden_buf>> * hiddens;
-
-    // tape recording (for DeltaNet state rollback)
-    bool tape_enabled = false;
-    std::vector<int32_t> recurrent_layer_ids;       // model layer indices that are DeltaNet
-    std::unordered_map<std::string, std::pair<int, int>> tape_name_map;  // name → (layer_idx, type)
-    std::vector<dflash_tape_layer> tape_layers;     // one per recurrent layer (CPU fallback)
-
-    // GPU-resident tape: graph writes directly to these tensors (no eval callback sync).
-    // One entry per slot for multi-slot DFlash (see --dflash-max-slots). For single-slot
-    // (default), `tapes` has size 1 and `active_tape_idx` is always 0 — behavior is
-    // byte-identical to the pre-multi-slot singleton.
-    std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
-    int active_tape_idx = 0;
-
-    // Active ubatch for the in-flight process_ubatch() call. The eval callback
-    // reads ubatch->n_seqs_unq / ubatch->seq_id to route hidden-state captures
-    // to layer_hiddens[seq] (per-token scatter under multi-seq ubatches).
-    // ggml's scheduler serializes callbacks within a graph compute, so this
-    // pointer is safe to read without synchronization.
-    const llama_ubatch * ubatch = nullptr;
-
-    // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
-    std::vector<float> scatter_buf;
-
-    dflash_tape_gpu * active_tape() const {
-        return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
-                   ? tapes[active_tape_idx].get()
-                   : nullptr;
-    }
-
-    std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
-        if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
-            return nullptr;
-        }
-        return &(*hiddens)[slot];
-    }
-
-    std::vector<dflash_layer_hidden_buf> * active_slot_hiddens() const {
-        return slot_hiddens(active_tape_idx);
-    }
-
-    // persistent GPU buffer for tape replay (avoids per-call alloc/free)
-    ggml_backend_buffer_t replay_buf = nullptr;
-    size_t replay_buf_size = 0;
-
-    // S2: pre-allocated zeros buffer for Q input (avoids per-call alloc+zero)
-    std::vector<float> replay_zeros;
-
-    // async tape replay state (GDN launched, waiting for sync before conv rebuild)
-    bool replay_pending = false;
-    ggml_backend_t replay_gpu_backend = nullptr;
-    ggml_context * replay_graph_ctx = nullptr;
-    int replay_n_accepted = 0;
-    int32_t replay_cell_idx = -1;
-    llama_seq_id replay_seq_id = 0;
-    llama_memory_recurrent * replay_mem_recurrent = nullptr;
-
-    ~dflash_capture_data() {
-        if (replay_graph_ctx) {
-            ggml_free(replay_graph_ctx);
-        }
-        if (replay_buf) {
-            ggml_backend_buffer_free(replay_buf);
-        }
-    }
-};
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -225,20 +81,14 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
-    int32_t * get_logits_argmax();
-    int32_t   get_logits_argmax_n();
-    int32_t   get_logits_argmax_k();
-    float   * get_logits_argmax_probs();  // log-probs of top-K tokens (when temp > 0)
-
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
-    ggml_tensor * get_t_h_pre_norm() const;
-    ggml_tensor * get_t_mtp_out()    const;
+    float * get_embeddings_nextn();
+    float * get_embeddings_nextn_ith(int32_t i);
 
-    void            set_mtp(llama_context * ctx_mtp_in);
-    llama_context * get_mtp() const { return mtp.ctx_mtp; }
+    float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -263,6 +113,9 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -377,6 +230,10 @@ private:
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
+    // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+    // from backend into host-side embd_layer_inp buffers
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
     //
     // graph
     //
@@ -396,81 +253,6 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
-    // DFlash hidden state accessors
-    float * get_layer_hidden(int layer_idx);
-    int64_t get_layer_hidden_n_tokens(int layer_idx) const;
-    int64_t get_layer_hidden_n_embd(int layer_idx) const;
-    int32_t get_n_layer_hiddens() const;
-
-    // DFlash: configure hidden state capture layers
-    void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
-    void set_dflash_sample_temp(float temp);
-    void set_dflash_topk(int k);
-    void set_dflash_n_slots(int n);
-
-    // DFlash: reset hidden-state capture for a fresh decode() call so the
-    // eval callback accumulates across this call's ubatches
-    void dflash_reset_hidden_capture();
-
-    // DFlash: enable/disable tape recording for DeltaNet state rollback
-    void set_tape_recording(bool enable);
-    void dflash_ensure_recurrent_setup();
-
-    // DFlash: allocate GPU-resident tape buffer for graph-embedded recording.
-    // n_slots > 1 allocates per-slot buffers so concurrent slots (llama-server -np > 1)
-    // don't clobber each other's tape entries. The single-arg overload keeps legacy
-    // callers single-slot.
-    void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
-    void allocate_tape_gpu(int n_slots, int max_tokens);
-
-    // DFlash: select which slot's tape the next llama_decode() writes into.
-    // Must be called before each decode when multi-slot tape is in use.
-    // No-op when n_slots == 1. Invalidates graph reuse if the slot changes.
-    void set_active_dflash_slot(int slot_idx);
-
-    // DFlash: replay tape data to reconstruct DeltaNet state for n_accepted tokens
-    void tape_replay(llama_seq_id seq_id, int n_accepted);
-    void tape_replay_sync();
-    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
-    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
-
-    // DFlash: complete rollback for hybrid models (KV trim + recurrent restore + tape replay)
-    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
-
-    // DFlash: prepare DeltaNet state for branch verification (recurrent restore + tape replay, no KV touch)
-    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
-
-    // DFlash: set cross data for drafter context
-    void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
-
-    // DFlash multi-slot: stash cross data keyed by seq_id. Multiple slots can
-    // each set their own buffer before a batched drafter decode. seq_id < 0
-    // routes to the legacy single-slot path (set_cross_data).
-    void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
-
-    // DFlash GPU ring: allocate ring on GPU backend, returns opaque handle
-    void * init_cross_ring_gpu(int n_layers, int n_embd, int ring_size);
-
-    // DFlash GPU ring: set GPU device pointer as cross data source (D2D path)
-    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
-    void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
-                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
-
-    // DDTree: set/clear tree attention mask for verification
-    void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
-    void clear_tree_mask();
-
-    // DDTree: tree-mode parent IDs for SSM kernels
-    void set_tree_parent_ids(const int32_t * parents, int n_tokens);
-    void clear_tree_parent_ids();
-
-    // DDTree: allocate persistent intermediate buffers for tree verify
-    void allocate_tree_buffers(int max_tree_tokens);
-
-    // DDTree: rollback SSM state to accepted token from intermediates
-    void tree_rollback(int commit_n, const int32_t * parents);
-    void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
-
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -480,11 +262,9 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
-    void handle_mtp_for_ubatch(
-            int32_t                n_tokens,
-            const llama_token    * tokens,
-            const llama_pos      * positions,
-            struct ggml_tensor   * t_h_pre_norm);
+    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
+    // that differs from the layer it belongs to (usually due to missing backend support)
+    void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -506,22 +286,23 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
-    llama_mtp mtp;
-
-    std::unique_ptr<llama_memory_i> memory;
+    llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
-    // GPU argmax/topk results (1-dimensional: [K * n_outputs])
-    std::vector<int32_t> logits_argmax_buf;
-    std::vector<float>   logits_argmax_prob_buf;  // log-probs of top-K tokens (when temp > 0)
-    int32_t logits_argmax_count = 0;
-    int32_t logits_argmax_k = 1;  // K value (1 = argmax, >1 = top-K)
-
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+
+    // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
+    // populated only when cparams.embeddings_nextn is enabled and the model graph
+    // sets llm_graph_result::t_h_nextn
+    buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // host buffers for output layer input embeddings, per layer
+    // populated when cparams.output_layer_inp[il] is true
+    std::vector<buffer_view<float>> embd_layer_inp;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -545,29 +326,6 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
-
-    // DFlash: captured hidden states (outer: per-slot matching dflash_capture->tapes,
-    // inner: per-captured-layer). Single-slot default is 1 × n_capture_layers.
-    std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
-
-    std::unique_ptr<dflash_capture_data> dflash_capture;
-
-    // DDTree: tree attention mask (set before verification decode, cleared after)
-    llama_tree_mask tree_mask;
-
-    // DDTree: tree-mode parent IDs and persistent SSM intermediate buffers
-    struct {
-        bool active = false;
-        bool disabled = false;                     // multi-GPU: tree ops can't span devices
-        int n_tokens = 0;
-        int n_seq0_tokens = 0;                     // tokens on seq_id=0 in last batch (for pos rollback)
-        std::vector<int32_t> parent_ids_cpu;       // [max_tree_tokens] host copy
-        ggml_backend_buffer_t buffer = nullptr;    // GPU allocation for all intermediates + parent_ids
-        ggml_context * ggml_ctx = nullptr;         // context owning tensor metadata
-        ggml_tensor * parent_ids_gpu = nullptr;    // [max_tree_tokens] i32 on GPU
-        std::vector<ggml_tensor *> ssm_intermediates; // per recurrent layer: [S_v*S_v*H*max_tokens] f16
-        int max_tree_tokens = 0;
-    } tree_bufs;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

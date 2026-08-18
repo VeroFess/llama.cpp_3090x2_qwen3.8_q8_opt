@@ -33,6 +33,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
+        model.hparams,
         type_k,
         type_v,
         v_trans,
@@ -43,9 +44,11 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
+        nullptr,
         filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recurrent(il); }
+            [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
+        nullptr,
         nullptr
     )),
     mem_recr(new llama_memory_recurrent(
@@ -57,7 +60,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_seq_max,
         n_rs_seq,
         filter_recr == nullptr ?
-            [&](int32_t il) { return hparams.is_recurrent(il); }
+            [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
     )) {}
 
@@ -71,16 +74,19 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         while (true) {
             llama_ubatch ubatch;
 
-            // DFlash target models need per-seq ubatches so the per-ubatch slot
-            // switch in llama_context::decode() can route hidden-state capture
-            // and tape writes to the correct slot.
-            if (embd_all || force_split_seq) {
+            if (embd_all) {
                 // if all tokens are output, split by sequence
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                 const bool unified = (mem_attn->get_n_stream() == 1);
-                ubatch = balloc.split_equal(n_ubatch, !unified);
+
+                // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                //   so that the rollback snapshots remain valid
+                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -135,11 +141,12 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Always attempt both removals. Attention cache must be cleaned up
-    // even if recurrent rollback fails (e.g. no checkpoint available).
-    bool ok_recr = mem_recr->seq_rm(seq_id, p0, p1);
-    bool ok_attn = mem_attn->seq_rm(seq_id, p0, p1);
-    return ok_recr && ok_attn;
+    // Try removing from the recurrent cache first since it may fail. If it does
+    // fail, the cache will not have been mutated.
+    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -265,14 +272,6 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
-}
-
-ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_forward() const {
-    return ctx_attn ? ctx_attn->get_turbo_rot_forward() : nullptr;
-}
-
-ggml_tensor * llama_memory_hybrid_context::get_turbo_rot_inverse() const {
-    return ctx_attn ? ctx_attn->get_turbo_rot_inverse() : nullptr;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

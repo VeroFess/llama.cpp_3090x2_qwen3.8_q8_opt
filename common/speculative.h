@@ -3,24 +3,19 @@
 #include "llama.h"
 #include "common.h"
 
-#include <unordered_map>
-#include <vector>
-
 struct common_speculative;
 
-// DDTree: tree of likely continuations built from draft logits
-struct common_speculative_tree {
-    std::vector<llama_token> tokens;   // [n_nodes] tree node tokens (topological order)
-    std::vector<int32_t>     parents;  // [n_nodes+1] parent index (-1 for root, 0-based for nodes)
-    std::vector<int32_t>     depths;   // [n_nodes] depth (1-based: root's children = 1)
-    std::vector<std::unordered_map<llama_token, int>> child_maps; // [n_nodes+1] token → child node index (1-based)
-    std::vector<uint8_t>     visibility; // [(n_nodes+1)²] row-major: visibility[i*(n+1)+j] = node i can attend to node j
-    int n_nodes = 0;
-    int main_path_len = 0; // number of main-path nodes (indices 1..main_path_len in batch)
-};
+// comma separated list the provided types
+std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
 // comma separated list of all types
-std::string common_speculative_type_name_str();
+const char * common_speculative_all_types_str();
+
+// parse user provided types
+std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
+
+// infer the spec types from the GGUF metadata of a draft model; empty if unknown
+std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
@@ -28,85 +23,62 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
-// check if the llama_context is compatible for speculative decoding
-// note: clears the memory of the context
-bool common_speculative_is_compat(llama_context * ctx_tgt);
+// return the max number of draft tokens based on the speculative parameters
+int32_t common_speculative_n_max(const common_params_speculative * spec);
 
-// Create a drafter context that can be shared across multiple common_speculative
-// instances (DFlash multi-slot). The caller owns the returned context and must
-// release it with llama_free after all dependent common_speculative instances
-// have been freed. Returns nullptr if the speculative params have no draft model.
-// topk / sample_temp / other per-ctx_dft config is applied here so the shared
-// context is fully configured before it is wired into any common_speculative.
-// dflash_n_slots: initial DFlash drafter graph width (1 for non-DFlash or single-slot).
-// Sets cparams_dft.dflash_n_slots before llama_init_from_model so the initial reserve
-// allocates a compute buffer sized for the target slot count.
-llama_context * common_speculative_create_ctx_dft(const common_params_speculative & params, int dflash_n_slots = 1);
+common_params common_base_params_to_speculative(const common_params & params);
 
-common_speculative * common_speculative_init(
-        common_params_speculative & params,
-        llama_context             * ctx_tgt,
-        llama_context             * ctx_dft_shared = nullptr);
+struct common_speculative_output_limits {
+    int32_t total;
+    int32_t per_seq;
+};
+
+// return the output limits needed for speculative decoding
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
+
+common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
 
+struct common_speculative_draft_params {
+    // this flag is used to chain the drafts through all the available implementations
+    // after the first successful draft from an implementation, we set it
+    //   to false to prevent further drafts for that sequence
+    // at the end of the draft() call, all drafting flags will be reset to false
+    bool drafting = false;
+
+    // overrides individual configurations (-1 disabled)
+    // can be used to constraint the max draft based on the remaining context size
+    int32_t n_max = -1;
+
+    llama_pos   n_past;
+    llama_token id_last;
+
+    // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+    const llama_tokens * prompt;
+
+    // the generated draft from the last _draft() call
+    llama_tokens * result;
+};
+
+common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+
 // optionally call once at the beginning of a new generation
-void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// inform the speculative stack which server slot (seq_id on ctx_tgt and the
-// shared ctx_dft) this instance services. Safe to call multiple times;
-// no-op for non-DFlash impls.
-void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id);
+// process the batch and update the internal state of the speculative context
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
-// sample up to n_draft tokens and add them to the batch using the draft model
-llama_tokens common_speculative_draft(
-                     common_speculative * spec,
-        const common_params_speculative & params,
-                     const llama_tokens & prompt,
-                            llama_token   id_last,
-                     std::vector<float> * draft_log_probs = nullptr);
+// generate drafts for the sequences specified with `common_speculative_get_draft_params`
+void common_speculative_draft(common_speculative * spec);
 
-// Batched DFlash draft: all specs prepare cross data, one combined multi-seq
-// decode, results distributed back. Each spec must have had set_seq_id called
-// and share the same ctx_dft. Specs without a ready DFlash impl get empty
-// results. Does not run extension impls (CopySpec etc.) — caller should
-// extend per-spec results afterwards if desired.
-void common_speculative_draft_batch(
-        std::vector<common_speculative *> & specs,
-        llama_context                     * ctx_dft,
-        const common_params_speculative   & params,
-        const std::vector<llama_token>    & id_last_per_spec,
-        std::vector<llama_tokens>         & result_per_spec);
+// informs the speculative context that n_accepted tokens were accepted by the target model
+void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
-// informs the speculative decoder that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
-
-// update implementations with logits from the verification decode
-void common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
-
-// flush hidden states captured during the current prefill sub-batch into
-// the DFlash ring buffer. Call after each llama_decode during split prefill
-// so checkpoint placement doesn't lose hidden state context.
-void common_speculative_flush_prefill(common_speculative * spec);
-
-// save/restore ring buffer state for checkpoint persistence.
-// the ring contains target hidden states needed by the DFlash drafter's
-// cross-attention. Without this, checkpoint-restored prefills lose context.
-size_t common_speculative_ring_state_size(const common_speculative * spec);
-void   common_speculative_ring_state_save(const common_speculative * spec, uint8_t * buf, size_t size);
-bool   common_speculative_ring_state_load(common_speculative * spec, const uint8_t * buf, size_t size);
-
-// DDTree: build a tree of likely continuations from draft logits
-// tree_budget: max tree nodes (0 = flat DFlash, >0 = DDTree)
-common_speculative_tree common_speculative_draft_tree(
-                     common_speculative * spec,
-        const common_params_speculative & params,
-                     const llama_tokens & prompt,
-                            llama_token   id_last,
-                                    int   tree_budget);
-
-int32_t common_speculative_n_max(const common_speculative * spec, const common_params_speculative & params);
-int32_t common_speculative_n_min(const common_speculative * spec, const common_params_speculative & params);
+// (optional) get/set internal state
+bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
@@ -116,3 +88,19 @@ struct common_speculative_deleter {
 };
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
+
+struct common_speculative_init_result {
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    ~common_speculative_init_result();
+
+    llama_model   * model();
+    llama_context * context();
+
+private:
+    struct impl;
+    std::unique_ptr<impl> pimpl;
+};
+
+using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
+
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);

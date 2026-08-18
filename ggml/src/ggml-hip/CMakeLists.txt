@@ -80,10 +80,6 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-    if (WIN32)
-        file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec-instance-*turbo*.cu")
-        list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    endif()
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -116,10 +112,6 @@ endif()
 
 if (GGML_HIP_NO_VMM)
     add_compile_definitions(GGML_HIP_NO_VMM)
-endif()
-
-if (GGML_HIP_ROCWMMA_FATTN)
-    add_compile_definitions(GGML_HIP_ROCWMMA_FATTN)
 endif()
 
 if (NOT GGML_HIP_MMQ_MFMA)

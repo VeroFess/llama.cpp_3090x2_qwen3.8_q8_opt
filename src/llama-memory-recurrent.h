@@ -66,19 +66,13 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
-    // cell management for speculative decoding checkpoint/restore
-    void copy_cell(int32_t i_src, int32_t i_dst);
-    int  get_cell_count(llama_seq_id seq_id) const;
-
-    bool expand(uint32_t new_mem_size);
-    bool shrink(uint32_t new_mem_size);
-
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
@@ -126,8 +120,6 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
-
-    bool resize(uint32_t new_mem_size);
 
     size_t total_size() const;
 
