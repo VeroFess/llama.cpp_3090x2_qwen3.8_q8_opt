@@ -1116,9 +1116,22 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_qwen38_paged::set_input(const llama_ubatch * /*ubatch*/) {
     const llama_paged_kv_metadata * metadata = mctx->get_paged_metadata();
     GGML_ASSERT(metadata != nullptr);
-    for (uint32_t device = 0; device < 2; ++device) {
-        ggml_backend_tensor_set(write_slots[device], metadata->write_slots[device].data(), 0, ggml_nbytes(write_slots[device]));
-        ggml_backend_tensor_set(block_tables[device], metadata->block_tables[device].data(), 0, ggml_nbytes(block_tables[device]));
+    if (mctx->get_paged_pool()->tensor_sharded()) {
+        std::vector<int32_t> slots;
+        slots.reserve(metadata->write_slots[0].size() + metadata->write_slots[1].size());
+        slots.insert(slots.end(), metadata->write_slots[0].begin(), metadata->write_slots[0].end());
+        slots.insert(slots.end(), metadata->write_slots[1].begin(), metadata->write_slots[1].end());
+        std::vector<int32_t> tables;
+        tables.reserve(metadata->block_tables[0].size() + metadata->block_tables[1].size());
+        tables.insert(tables.end(), metadata->block_tables[0].begin(), metadata->block_tables[0].end());
+        tables.insert(tables.end(), metadata->block_tables[1].begin(), metadata->block_tables[1].end());
+        ggml_backend_tensor_set(write_slots[0], slots.data(), 0, ggml_nbytes(write_slots[0]));
+        ggml_backend_tensor_set(block_tables[0], tables.data(), 0, ggml_nbytes(block_tables[0]));
+    } else {
+        for (uint32_t device = 0; device < 2; ++device) {
+            ggml_backend_tensor_set(write_slots[device], metadata->write_slots[device].data(), 0, ggml_nbytes(write_slots[device]));
+            ggml_backend_tensor_set(block_tables[device], metadata->block_tables[device].data(), 0, ggml_nbytes(block_tables[device]));
+        }
     }
     ggml_backend_tensor_set(context_lens, metadata->context_lens.data(), 0, ggml_nbytes(context_lens));
     ggml_backend_tensor_set(batch_offsets, metadata->batch_offsets.data(), 0, ggml_nbytes(batch_offsets));
@@ -1131,9 +1144,32 @@ bool llm_graph_input_attn_qwen38_paged::can_reuse(const llm_graph_params & param
     if (metadata == nullptr) {
         return false;
     }
+    const int32_t next_tokens = metadata->context_lens.empty() ? 0 : *std::max_element(metadata->context_lens.begin(), metadata->context_lens.end());
+    const int32_t next_bucket = next_tokens <= 32768 ? GGML_PAD(next_tokens, 4096) : next_tokens <= 131072 ? GGML_PAD(next_tokens, 16384) : GGML_PAD(next_tokens, 32768);
+    std::array<int32_t, 2> next_starts = { -1, -1 };
+    if (metadata->n_sequences == 1 && !metadata->context_lens.empty()) {
+        const uint32_t page_size = next->get_paged_pool()->page_size();
+        const int32_t page_count = (metadata->context_lens[0] + page_size - 1) / page_size;
+        const int32_t capacity_pages = (next_bucket + static_cast<int32_t>(page_size) - 1) / static_cast<int32_t>(page_size);
+        for (uint32_t device = 0; device < 2; ++device) {
+            const int32_t start = metadata->block_tables[device][0];
+            bool contiguous = start >= 0 && start + capacity_pages <= static_cast<int32_t>(next->get_paged_pool()->n_pages());
+            for (int32_t page = 0; contiguous && page < page_count; ++page) {
+                contiguous = metadata->block_tables[device][page] == start + page;
+            }
+            next_starts[device] = contiguous ? start : -1;
+        }
+        if (next->get_paged_pool()->tensor_sharded() && next_starts[0] != next_starts[1]) {
+            next_starts = { -1, -1 };
+        }
+    }
     mctx = next;
+    const bool tensor_sharded = next->get_paged_pool()->tensor_sharded();
     return write_slots[0]->ne[0] == static_cast<int64_t>(metadata->write_slots[0].size()) &&
-        block_tables[0]->ne[0] == metadata->max_blocks && block_tables[0]->ne[1] == metadata->n_sequences;
+        write_slots[0]->ne[1] == (tensor_sharded ? 2 : 1) &&
+        block_tables[0]->ne[0] == metadata->max_blocks && block_tables[0]->ne[1] == metadata->n_sequences &&
+        block_tables[0]->ne[2] == (tensor_sharded ? 2 : 1) &&
+        context_tokens == next_bucket && contiguous_starts == next_starts;
 }
 
 // TODO: Hybrid input classes are a bit redundant.
@@ -3517,11 +3553,49 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
         const int32_t n_tokens_paged = metadata ? static_cast<int32_t>(metadata->write_slots[0].size()) : static_cast<int32_t>(ubatch.n_tokens);
         const int32_t n_sequences = metadata ? metadata->n_sequences : std::max<int32_t>(1, ubatch.n_seqs_unq);
         const int32_t max_blocks = metadata ? metadata->max_blocks : static_cast<int32_t>(mctx_cur->get_paged_pool()->n_pages());
-        for (uint32_t device = 0; device < 2; ++device) {
-            inp_paged->write_slots[device] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens_paged);
-            inp_paged->block_tables[device] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, max_blocks, n_sequences);
-            ggml_set_input(inp_paged->write_slots[device]);
-            ggml_set_input(inp_paged->block_tables[device]);
+        const int32_t context_tokens = metadata && !metadata->context_lens.empty() ? *std::max_element(metadata->context_lens.begin(), metadata->context_lens.end()) : static_cast<int32_t>(ubatch.n_tokens);
+        inp_paged->context_tokens = context_tokens <= 32768 ? GGML_PAD(context_tokens, 4096) : context_tokens <= 131072 ? GGML_PAD(context_tokens, 16384) : GGML_PAD(context_tokens, 32768);
+        if (metadata && metadata->n_sequences == 1 && !metadata->context_lens.empty()) {
+            const uint32_t page_size = mctx_cur->get_paged_pool()->page_size();
+            const int32_t page_count = (metadata->context_lens[0] + page_size - 1) / page_size;
+            const int32_t capacity_pages = (inp_paged->context_tokens + static_cast<int32_t>(page_size) - 1) / static_cast<int32_t>(page_size);
+            for (uint32_t device = 0; device < 2; ++device) {
+                const int32_t start = metadata->block_tables[device][0];
+                bool contiguous = start >= 0 && start + capacity_pages <= static_cast<int32_t>(mctx_cur->get_paged_pool()->n_pages());
+                for (int32_t page = 0; contiguous && page < page_count; ++page) {
+                    contiguous = metadata->block_tables[device][page] == start + page;
+                }
+                inp_paged->contiguous_starts[device] = contiguous ? start : -1;
+            }
+            if (mctx_cur->get_paged_pool()->tensor_sharded() && inp_paged->contiguous_starts[0] != inp_paged->contiguous_starts[1]) {
+                inp_paged->contiguous_starts = { -1, -1 };
+            }
+        }
+        inp_paged->partitions = inp_paged->context_tokens <= 4096 ? 1 : inp_paged->context_tokens <= 32768 ? 4 : inp_paged->context_tokens <= 131072 ? 8 : 16;
+        const int64_t head_dim = hparams.n_embd_head_k();
+        const int64_t n_heads = hparams.n_head();
+        size_t scratch_bytes = inp_paged->partitions > 1 ?
+            (head_dim + 2) * n_heads * n_tokens_paged * inp_paged->partitions * sizeof(float) : 0;
+        if (n_sequences == 1 && inp_paged->contiguous_starts[0] >= 0) {
+            const size_t mask_bytes = static_cast<size_t>(GGML_PAD(inp_paged->context_tokens, 256)) * n_tokens_paged * sizeof(ggml_fp16_t);
+            scratch_bytes = std::max(scratch_bytes, mask_bytes);
+        }
+        const size_t scratch_elements = (scratch_bytes + sizeof(float) - 1) / sizeof(float);
+        inp_paged->scratch = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scratch_elements > 0 ? scratch_elements : 1);
+        if (mctx_cur->get_paged_pool()->tensor_sharded()) {
+            inp_paged->write_slots[0] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens_paged, 2);
+            inp_paged->block_tables[0] = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, max_blocks, n_sequences, 2);
+            ggml_set_name(inp_paged->write_slots[0], "qwen38_paged_write_slots_tp");
+            ggml_set_name(inp_paged->block_tables[0], "qwen38_paged_block_tables_tp");
+            ggml_set_input(inp_paged->write_slots[0]);
+            ggml_set_input(inp_paged->block_tables[0]);
+        } else {
+            for (uint32_t device = 0; device < 2; ++device) {
+                inp_paged->write_slots[device] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens_paged);
+                inp_paged->block_tables[device] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, max_blocks, n_sequences);
+                ggml_set_input(inp_paged->write_slots[device]);
+                ggml_set_input(inp_paged->block_tables[device]);
+            }
         }
         inp_paged->context_lens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_sequences);
         inp_paged->batch_offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_sequences);

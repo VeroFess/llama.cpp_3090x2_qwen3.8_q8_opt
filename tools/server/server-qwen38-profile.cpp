@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -192,11 +193,24 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
     if (!qwen38_load_tuning(params, tuning, error)) {
         return false;
     }
-    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
-        error = "the Qwen3.8 profile requires --split-mode layer";
+    const bool tensor_mode = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER && !tensor_mode) {
+        error = "the Qwen3.8 profile requires --split-mode layer or tensor";
         return false;
     }
-    if (has_tensor_split(params)) {
+    if (tensor_mode && params.autotune_mode != "off") {
+        error = "tensor mode does not use the layer-placement autotune cache";
+        return false;
+    }
+    if (tensor_mode && has_tensor_split(params)) {
+        const bool equal_split = params.tensor_split[0] > 0.0f && params.tensor_split[1] > 0.0f &&
+            std::fabs(params.tensor_split[0] - params.tensor_split[1]) < 1e-6f &&
+            std::all_of(std::begin(params.tensor_split) + 2, std::end(params.tensor_split), [](float value) { return value == 0.0f; });
+        if (!equal_split) {
+            error = "the Qwen3.8 tensor profile requires an equal 1:1 tensor split";
+            return false;
+        }
+    } else if (!tensor_mode && has_tensor_split(params)) {
         error = "the Qwen3.8 profile rejects --tensor-split";
         return false;
     }
@@ -240,10 +254,16 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
     params.n_ctx = QWEN38_CONTEXT;
     params.n_parallel = QWEN38_SEQUENCES;
     params.n_gpu_layers = -2;
-    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-    params.tensor_split[0] = tuning.layer_boundary / 66.0f;
-    params.tensor_split[1] = (66 - tuning.layer_boundary) / 66.0f;
-    params.qwen38_layer_boundary = tuning.layer_boundary;
+    params.split_mode = tensor_mode ? LLAMA_SPLIT_MODE_TENSOR : LLAMA_SPLIT_MODE_LAYER;
+    if (tensor_mode) {
+        params.tensor_split[0] = 1.0f;
+        params.tensor_split[1] = 1.0f;
+        params.qwen38_layer_boundary = -1;
+    } else {
+        params.tensor_split[0] = tuning.layer_boundary / 66.0f;
+        params.tensor_split[1] = (66 - tuning.layer_boundary) / 66.0f;
+        params.qwen38_layer_boundary = tuning.layer_boundary;
+    }
     params.fit_params = false;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.cache_type_k = GGML_TYPE_Q8_0;
@@ -260,7 +280,7 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
     params.max_num_batched_tokens = params.autotune_mode == "quick" ? tuning.max_num_batched_tokens :
         (params.max_num_batched_tokens == 0 ? 2048 : params.max_num_batched_tokens);
     params.n_batch = params.max_num_batched_tokens;
-    params.n_ubatch = params.autotune_mode == "quick" ? tuning.ubatch_size : std::min(params.n_ubatch, 64);
+    params.n_ubatch = params.autotune_mode == "quick" ? tuning.ubatch_size : std::min(params.n_ubatch, 1024);
     params.gpu_memory_reserve_mib = params.gpu_memory_reserve_mib == 0 ? 1024 : params.gpu_memory_reserve_mib;
     params.kv_page_size = params.autotune_mode == "quick" ? tuning.kv_page_size : (params.kv_page_size == 0 ? 16 : params.kv_page_size);
     params.scheduler_target_step_ms = params.autotune_mode == "quick" ? tuning.scheduler_target_step_ms :
@@ -275,6 +295,7 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
     }
     params.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
     params.speculative.draft.cache_type_v = GGML_TYPE_Q8_0;
+    params.speculative.draft.backend_sampling = true;
     params.speculative.draft.n_max = params.autotune_mode == "quick" ? tuning.mtp_n_max : 2;
     params.deployment_profile_applied = true;
 
@@ -390,8 +411,9 @@ bool server_qwen38_profile_validate_model(common_params & params, const llama_mo
 
     const auto * model = static_cast<const llama_model *>(model_ptr);
     const auto & hparams = model->hparams;
-    if (model->arch != LLM_ARCH_QWEN35 || model->split_mode() != LLAMA_SPLIT_MODE_LAYER) {
-        error = "the model is not a layer-split Qwen3.8 GGUF";
+    const bool tensor_mode = model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    if (model->arch != LLM_ARCH_QWEN35 || (model->split_mode() != LLAMA_SPLIT_MODE_LAYER && !tensor_mode)) {
+        error = "the model is not a supported Qwen3.8 multi-GPU GGUF";
         return false;
     }
     if (hparams.n_layer() != 64 || hparams.n_embd != 5120 || hparams.n_ctx_train != QWEN38_CONTEXT) {
@@ -404,42 +426,64 @@ bool server_qwen38_profile_validate_model(common_params & params, const llama_mo
     }
 
     int recurrent_layers = 0;
-    int layer_boundary = -1;
-    ggml_backend_dev_t first_device = model->dev_layer(0);
-    ggml_backend_dev_t second_device = nullptr;
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         recurrent_layers += hparams.is_recr(il) ? 1 : 0;
-        if (ggml_backend_dev_type(model->dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
-            error = "model layer " + std::to_string(il) + " is not on a GPU";
-            return false;
-        }
-        if (model->dev_layer(il) != first_device && layer_boundary < 0) {
-            layer_boundary = static_cast<int>(il);
-            second_device = model->dev_layer(il);
-        }
-        if (layer_boundary >= 0 && model->dev_layer(il) == first_device) {
-            error = "model layers are not assigned in two contiguous ranges";
-            return false;
-        }
     }
     if (recurrent_layers != 48 || hparams.n_layer_nextn < 1) {
         error = "the model does not contain the required DeltaNet and MTP layout";
         return false;
     }
-    if (layer_boundary < 28 || layer_boundary > 36 || layer_boundary % 4 != 0) {
-        error = "the selected layer boundary " + std::to_string(layer_boundary) + " is outside the Qwen3.8 group candidates";
-        return false;
-    }
-    params.qwen38_layer_boundary = layer_boundary;
-    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
-        if (model->dev_layer(il) != second_device) {
-            error = "MTP layer " + std::to_string(il) + " is not on the second pipeline stage";
+
+    int layer_boundary = -1;
+    if (tensor_mode) {
+        ggml_backend_dev_t meta_device = model->dev_layer(0);
+        if (ggml_backend_dev_type(meta_device) != GGML_BACKEND_DEVICE_TYPE_META) {
+            error = "tensor mode did not create a Meta device";
             return false;
         }
-    }
-    if (model->dev_output() != second_device) {
-        error = "the output head is not on the second pipeline stage";
-        return false;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (model->dev_layer(il) != meta_device) {
+                error = "tensor mode placed layer " + std::to_string(il) + " outside the Meta device";
+                return false;
+            }
+        }
+        if (model->dev_output() != meta_device) {
+            error = "tensor mode placed the output head outside the Meta device";
+            return false;
+        }
+        params.qwen38_layer_boundary = -1;
+    } else {
+        ggml_backend_dev_t first_device = model->dev_layer(0);
+        ggml_backend_dev_t second_device = nullptr;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (ggml_backend_dev_type(model->dev_layer(il)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                error = "model layer " + std::to_string(il) + " is not on a GPU";
+                return false;
+            }
+            if (model->dev_layer(il) != first_device && layer_boundary < 0) {
+                layer_boundary = static_cast<int>(il);
+                second_device = model->dev_layer(il);
+            }
+            if (layer_boundary >= 0 && model->dev_layer(il) == first_device) {
+                error = "model layers are not assigned in two contiguous ranges";
+                return false;
+            }
+        }
+        if (layer_boundary < 28 || layer_boundary > 36 || layer_boundary % 4 != 0) {
+            error = "the selected layer boundary " + std::to_string(layer_boundary) + " is outside the Qwen3.8 group candidates";
+            return false;
+        }
+        params.qwen38_layer_boundary = layer_boundary;
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            if (model->dev_layer(il) != second_device) {
+                error = "MTP layer " + std::to_string(il) + " is not on the second pipeline stage";
+                return false;
+            }
+        }
+        if (model->dev_output() != second_device) {
+            error = "the output head is not on the second pipeline stage";
+            return false;
+        }
     }
 
     size_t q8_matrices = 0;
@@ -477,8 +521,13 @@ bool server_qwen38_profile_validate_model(common_params & params, const llama_mo
     if (params.autotune_mode == "quick") {
         LOG_INF("qwen38 profile: autotune cache validated, key_sha256=%s\n", params.autotune_cache_key_sha256.c_str());
     }
-    LOG_INF("qwen38 profile: model validated, layers=64, boundary=%d/%d, recurrent=48, attention=16, q8_matrices=%zu, mtp_layers=%u\n",
-        layer_boundary, 64 - layer_boundary, q8_matrices, hparams.n_layer_nextn);
+    if (tensor_mode) {
+        LOG_INF("qwen38 profile: model validated, layers=64, tensor_split=1/1, recurrent=48, attention=16, q8_matrices=%zu, mtp_layers=%u\n",
+            q8_matrices, hparams.n_layer_nextn);
+    } else {
+        LOG_INF("qwen38 profile: model validated, layers=64, boundary=%d/%d, recurrent=48, attention=16, q8_matrices=%zu, mtp_layers=%u\n",
+            layer_boundary, 64 - layer_boundary, q8_matrices, hparams.n_layer_nextn);
+    }
     LOG_INF("qwen38 profile: max_model_len=%d, max_num_seqs=%d, kv=q8_0, page_size=%d, reserve_mib=%d\n",
         QWEN38_CONTEXT, QWEN38_SEQUENCES, params.kv_page_size, params.gpu_memory_reserve_mib);
     return true;

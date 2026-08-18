@@ -1332,8 +1332,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (src->view_src != NULL) {
                     // views are always on the same backend as the source
                     *src_backend_id = tensor_backend_id(src->view_src);
-                    SET_CAUSE(src, "4.vsrc");
-                } else {
+                    if (*src_backend_id != -1) {
+                        SET_CAUSE(src, "4.vsrc");
+                    }
+                }
+                if (*src_backend_id == -1) {
                     *src_backend_id = *cur_backend_id;
                     SET_CAUSE(src, "4.cur");
                 }

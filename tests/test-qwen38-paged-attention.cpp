@@ -35,15 +35,16 @@ int main() {
     ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads, 1);
     ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads_kv, 1);
     ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_heads_kv, 1);
-    ggml_tensor * cache = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, head_dim, block_size, 2 * n_heads_kv, n_blocks);
+    ggml_tensor * cache = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, head_dim, block_size, n_blocks, 2 * n_heads_kv);
     ggml_tensor * block_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, max_blocks, 1);
     ggml_tensor * write_slots = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * context_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * batch_offsets = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_tensor * batch_lens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * scratch = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (head_dim + 2) * n_heads * 4);
     ggml_tensor * output = ggml_qwen38_paged_attn(
-        ctx, q, k, v, cache, block_table, write_slots, context_lens, batch_offsets, batch_lens,
-        1.0f / std::sqrt(static_cast<float>(head_dim)), block_size, max_blocks, 4);
+        ctx, q, k, v, cache, block_table, write_slots, context_lens, batch_offsets, batch_lens, scratch,
+        1.0f / std::sqrt(static_cast<float>(head_dim)), block_size, max_blocks, 4, 65, -1);
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (buffer == nullptr) {
@@ -80,8 +81,8 @@ int main() {
     for (int physical_page = 1; physical_page <= 4; ++physical_page) {
         for (int head = 0; head < n_heads_kv; ++head) {
             for (int token = 0; token < block_size; ++token) {
-                const size_t k_offset = static_cast<size_t>(physical_page) * cache->nb[3] + static_cast<size_t>(head) * cache->nb[2] + static_cast<size_t>(token) * cache->nb[1];
-                const size_t v_offset = static_cast<size_t>(physical_page) * cache->nb[3] + static_cast<size_t>(n_heads_kv + head) * cache->nb[2] + static_cast<size_t>(token) * cache->nb[1];
+                const size_t k_offset = static_cast<size_t>(head) * cache->nb[3] + static_cast<size_t>(physical_page) * cache->nb[2] + static_cast<size_t>(token) * cache->nb[1];
+                const size_t v_offset = static_cast<size_t>(n_heads_kv + head) * cache->nb[3] + static_cast<size_t>(physical_page) * cache->nb[2] + static_cast<size_t>(token) * cache->nb[1];
                 ggml_quantize_chunk(GGML_TYPE_Q8_0, k_data.data() + head * head_dim, cache_data.data() + k_offset, 0, 1, head_dim, nullptr);
                 ggml_quantize_chunk(GGML_TYPE_Q8_0, v_data.data() + head * head_dim, cache_data.data() + v_offset, 0, 1, head_dim, nullptr);
             }
@@ -102,27 +103,20 @@ int main() {
 
     std::vector<float> output_data(ggml_nelements(output));
     ggml_backend_tensor_get(output, output_data.data(), 0, ggml_nbytes(output));
-    std::vector<uint8_t> physical_page_0(cache->nb[3]);
-    std::vector<uint8_t> physical_page_1(cache->nb[3]);
-    std::vector<uint8_t> physical_page_5(cache->nb[3]);
-    ggml_backend_tensor_get(cache, physical_page_0.data(), 0, physical_page_0.size());
-    ggml_backend_tensor_get(cache, physical_page_1.data(), cache->nb[3], physical_page_1.size());
-    ggml_backend_tensor_get(cache, physical_page_5.data(), 5 * cache->nb[3], physical_page_5.size());
-    for (uint8_t value : physical_page_5) {
-        if (value != 0) {
-            fprintf(stderr, "%s : write escaped into an unreferenced physical page\n", __func__);
-            ggml_backend_buffer_free(buffer);
-            ggml_free(ctx);
-            ggml_backend_free(backend);
-            return 1;
-        }
-    }
+    ggml_backend_tensor_get(cache, cache_data.data(), 0, cache_data.size());
     bool referenced_page_written = false;
-    for (uint8_t value : physical_page_0) {
-        referenced_page_written |= value != 0;
-    }
-    for (uint8_t value : physical_page_1) {
-        referenced_page_written |= value != 0;
+    for (int head = 0; head < 2 * n_heads_kv; ++head) {
+        for (size_t offset = 0; offset < cache->nb[2]; ++offset) {
+            if (cache_data[head * cache->nb[3] + 5 * cache->nb[2] + offset] != 0) {
+                fprintf(stderr, "%s : write escaped into an unreferenced physical page\n", __func__);
+                ggml_backend_buffer_free(buffer);
+                ggml_free(ctx);
+                ggml_backend_free(backend);
+                return 1;
+            }
+            referenced_page_written |= cache_data[head * cache->nb[3] + offset] != 0;
+            referenced_page_written |= cache_data[head * cache->nb[3] + cache->nb[2] + offset] != 0;
+        }
     }
     if (!referenced_page_written) {
         fprintf(stderr, "%s : referenced physical page was not written\n", __func__);

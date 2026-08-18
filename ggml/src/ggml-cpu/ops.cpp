@@ -10742,6 +10742,67 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
 }
 
 // ggml_compute_forward_gated_delta_net
+static void ggml_compute_forward_gated_delta_net_wy_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src_k = dst->src[0];
+    const ggml_tensor * src_v = dst->src[1];
+    const ggml_tensor * src_g = dst->src[2];
+    const ggml_tensor * src_b = dst->src[3];
+
+    const int64_t S = src_k->ne[0];
+    const int64_t T = src_k->ne[1];
+    const int64_t n_chunks = src_k->ne[2];
+    const int64_t n_heads = src_k->ne[3];
+    const int64_t n_groups = n_chunks * n_heads;
+    const int64_t a_stride = T * T;
+    const int64_t wu_stride = S * T;
+
+    const float * k = (const float *) src_k->data;
+    const float * v = (const float *) src_v->data;
+    const float * g = (const float *) src_g->data;
+    const float * b = (const float *) src_b->data;
+    float * A = (float *) dst->data;
+    float * W = A + n_groups * a_stride;
+    float * U = W + n_groups * wu_stride;
+
+    for (int64_t group = params->ith; group < n_groups; group += params->nth) {
+        const float * kg = k + group * wu_stride;
+        const float * vg = v + group * wu_stride;
+        const float * gg = g + group * T;
+        const float * bg = b + group * T;
+        float * Ag = A + group * a_stride;
+        float * Wg = W + group * wu_stride;
+        float * Ug = U + group * wu_stride;
+
+        for (int64_t i = 0; i < T; ++i) {
+            for (int64_t j = 0; j < T; ++j) {
+                float value = 0.0f;
+                if (i > j) {
+                    for (int64_t d = 0; d < S; ++d) {
+                        value += kg[i * S + d] * kg[j * S + d];
+                    }
+                    value *= bg[i] * expf(gg[i] - gg[j]);
+                }
+                Ag[i * T + j] = value;
+            }
+        }
+
+        for (int64_t d = 0; d < S; ++d) {
+            for (int64_t i = 0; i < T; ++i) {
+                float w = bg[i] * kg[i * S + d] * expf(gg[i]);
+                float u = bg[i] * vg[i * S + d];
+                for (int64_t j = 0; j < i; ++j) {
+                    w -= Ag[i * T + j] * Wg[j * S + d];
+                    u -= Ag[i * T + j] * Ug[j * S + d];
+                }
+                Wg[i * S + d] = w;
+                Ug[i * S + d] = u;
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
     ggml_tensor * dst,
@@ -10940,6 +11001,13 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 1) >= 2) {
+        GGML_ABORT("gated DeltaNet chunk scan requires CUDA");
+    }
+    if (ggml_get_op_params_i32(dst, 1) == 1) {
+        ggml_compute_forward_gated_delta_net_wy_f32(params, dst);
+        return;
+    }
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

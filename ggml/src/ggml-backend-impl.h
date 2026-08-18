@@ -91,9 +91,14 @@ extern "C" {
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+    GGML_API bool ggml_backend_dev_is_meta   (ggml_backend_dev_t dev);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    GGML_API size_t             ggml_backend_meta_dev_n_devs    (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index);
+    GGML_API size_t             ggml_backend_meta_buffer_n_bufs  (ggml_backend_buffer_t meta_buf);
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);

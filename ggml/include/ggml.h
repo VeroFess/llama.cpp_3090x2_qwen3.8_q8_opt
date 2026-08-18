@@ -2590,6 +2590,23 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_wy(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g_cumsum,
+            struct ggml_tensor  * beta);
+
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_chunk_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int32_t               chunk_size);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2619,10 +2636,13 @@ extern "C" {
         struct ggml_tensor  * context_lens,
         struct ggml_tensor  * batch_offsets,
         struct ggml_tensor  * batch_lens,
+        struct ggml_tensor  * scratch,
         float                 scale,
         int32_t               block_size,
         int32_t               max_blocks,
-        int32_t               partitions);
+        int32_t               partitions,
+        int32_t               context_tokens,
+        int32_t               contiguous_start);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

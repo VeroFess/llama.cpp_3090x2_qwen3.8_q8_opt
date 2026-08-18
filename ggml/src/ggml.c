@@ -6356,6 +6356,91 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_wy(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g_cumsum,
+        struct ggml_tensor  * beta) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g_cumsum->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(g_cumsum));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_are_same_shape(k, v));
+    GGML_ASSERT(k->ne[1] == g_cumsum->ne[0]);
+    GGML_ASSERT(k->ne[2] == g_cumsum->ne[2]);
+    GGML_ASSERT(k->ne[3] == g_cumsum->ne[3]);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == k->ne[1]);
+    GGML_ASSERT(beta->ne[2] == k->ne[2] && beta->ne[3] == k->ne[3]);
+
+    const int64_t S = k->ne[0];
+    const int64_t T = k->ne[1];
+    const int64_t n_chunks = k->ne[2];
+    const int64_t n_heads = k->ne[3];
+    const int64_t n_elements = n_chunks * n_heads * (T * T + 2 * S * T);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
+
+    ggml_set_op_params_i32(result, 1, 1);
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = g_cumsum;
+    result->src[3] = beta;
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_chunk_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int32_t               chunk_size) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(g) && ggml_is_contiguous(beta) && ggml_is_contiguous(state));
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[2] == k->ne[2] && q->ne[3] == k->ne[3]);
+    GGML_ASSERT(v->ne[0] == q->ne[0] && v->ne[2] == q->ne[2] && v->ne[3] == q->ne[3]);
+    GGML_ASSERT(v->ne[1] % q->ne[1] == 0 && g->ne[0] == 1 && beta->ne[0] == 1);
+    GGML_ASSERT(g->ne[1] == v->ne[1] && beta->ne[1] == v->ne[1] && g->ne[2] == v->ne[2] && beta->ne[2] == v->ne[2]);
+    GGML_ASSERT(g->ne[3] == v->ne[3] && beta->ne[3] == v->ne[3]);
+    GGML_ASSERT(chunk_size == 64 && q->ne[0] == 128);
+
+    const int64_t S = q->ne[0];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t H = v->ne[1] * v->ne[3];
+    const int64_t n_chunks = (n_tokens + chunk_size - 1) / chunk_size;
+    const int64_t groups = H * n_chunks;
+    const int64_t st = S * chunk_size;
+    const int64_t tt = chunk_size * chunk_size;
+    const int64_t output_elements = groups * st;
+    const int64_t state_elements = H * S * S;
+    const int64_t scan_scratch = H * st;
+    const int64_t packed_qkv = 3 * groups * st;
+    const int64_t packed_gb = 2 * groups * chunk_size;
+    const int64_t wy = groups * (tt + 2 * st);
+    const int64_t scan_inputs = groups * (tt + 3 * st) + groups;
+    const int64_t workspace_elements = output_elements + state_elements + scan_scratch + packed_qkv + packed_gb + wy + scan_inputs;
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, workspace_elements);
+    ggml_set_op_params_i32(result, 1, 3);
+    ggml_set_op_params_i32(result, 2, chunk_size);
+    result->op = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
@@ -6403,10 +6488,13 @@ struct ggml_tensor * ggml_qwen38_paged_attn(
         struct ggml_tensor  * context_lens,
         struct ggml_tensor  * batch_offsets,
         struct ggml_tensor  * batch_lens,
+        struct ggml_tensor  * scratch,
         float                 scale,
         int32_t               block_size,
         int32_t               max_blocks,
-        int32_t               partitions) {
+        int32_t               partitions,
+        int32_t               context_tokens,
+        int32_t               contiguous_start) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k_new->type == GGML_TYPE_F32);
     GGML_ASSERT(v_new->type == GGML_TYPE_F32);
@@ -6416,29 +6504,38 @@ struct ggml_tensor * ggml_qwen38_paged_attn(
     GGML_ASSERT(context_lens->type == GGML_TYPE_I32);
     GGML_ASSERT(batch_offsets->type == GGML_TYPE_I32);
     GGML_ASSERT(batch_lens->type == GGML_TYPE_I32);
+    GGML_ASSERT(scratch->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[0] == k_new->ne[0] && k_new->ne[0] == v_new->ne[0]);
     GGML_ASSERT(k_new->ne[1] == v_new->ne[1]);
     GGML_ASSERT(q->ne[2] == k_new->ne[2] && k_new->ne[2] == v_new->ne[2]);
-    GGML_ASSERT(block_size > 0 && max_blocks > 0 && partitions > 0);
+    GGML_ASSERT(block_size > 0 && max_blocks > 0 && partitions > 0 && context_tokens > 0);
 
-    const int64_t output_elements = ggml_nelements(q);
     const int64_t scratch_elements = partitions > 1 ? (q->ne[0] + 2) * q->ne[1] * q->ne[2] * partitions : 0;
-    struct ggml_tensor * workspace = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, output_elements + scratch_elements);
-    workspace->op = GGML_OP_QWEN38_PAGED_ATTN;
-    workspace->src[0] = q;
-    workspace->src[1] = k_new;
-    workspace->src[2] = v_new;
-    workspace->src[3] = kv_cache;
-    workspace->src[4] = block_table;
-    workspace->src[5] = write_slots;
-    workspace->src[6] = context_lens;
-    workspace->src[7] = batch_offsets;
-    workspace->src[8] = batch_lens;
-    ggml_set_op_params_f32(workspace, 0, scale);
-    ggml_set_op_params_i32(workspace, 1, block_size);
-    ggml_set_op_params_i32(workspace, 2, max_blocks);
-    ggml_set_op_params_i32(workspace, 3, partitions);
-    return ggml_view_3d(ctx, workspace, q->ne[0], q->ne[1], q->ne[2], q->ne[0] * sizeof(float), q->ne[0] * q->ne[1] * sizeof(float), 0);
+    size_t workspace_bytes = scratch_elements * sizeof(float);
+    if (batch_lens->ne[0] == 1 && q->ne[2] >= 64 && contiguous_start >= 0) {
+        const int64_t context_padded = GGML_PAD(context_tokens, 256);
+        workspace_bytes = context_padded * q->ne[2] * sizeof(ggml_fp16_t);
+    }
+    GGML_ASSERT(ggml_nbytes(scratch) >= workspace_bytes);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2]);
+    result->op = GGML_OP_QWEN38_PAGED_ATTN;
+    result->src[0] = q;
+    result->src[1] = k_new;
+    result->src[2] = v_new;
+    result->src[3] = kv_cache;
+    result->src[4] = block_table;
+    result->src[5] = write_slots;
+    result->src[6] = context_lens;
+    result->src[7] = batch_offsets;
+    result->src[8] = batch_lens;
+    result->src[9] = scratch;
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, block_size);
+    ggml_set_op_params_i32(result, 2, max_blocks);
+    ggml_set_op_params_i32(result, 3, partitions);
+    ggml_set_op_params_i32(result, 4, context_tokens);
+    ggml_set_op_params_i32(result, 5, contiguous_start);
+    return result;
 }
 
 // ggml_dsv4_hc_comb

@@ -130,7 +130,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
 
                 ubatch = balloc.split_equal(
                     n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0,
-                    paged_pool != nullptr ? 4 : std::numeric_limits<uint32_t>::max());
+                    paged_pool != nullptr ? (paged_pool->tensor_sharded() ? 8 : 4) : std::numeric_limits<uint32_t>::max());
             }
 
             if (ubatch.n_tokens == 0) {

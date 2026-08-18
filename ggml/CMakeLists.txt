@@ -214,7 +214,6 @@ if (GGML_QWEN38_2X3090)
     if (NOT GGML_CUDA)
         message(FATAL_ERROR "GGML_QWEN38_2X3090 requires GGML_CUDA")
     endif()
-    set(GGML_CUDA_NCCL OFF CACHE BOOL "" FORCE)
     add_compile_definitions(GGML_QWEN38_2X3090)
 endif()
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING

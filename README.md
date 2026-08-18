@@ -1,4 +1,57 @@
-# llama.cpp
+# llama.cpp for Qwen3.8 27B Q8 on two RTX 3090s
+
+This fork is tuned for one deployment: `Qwen3.8-27B-Q8_0.gguf` on two 24 GB RTX 3090 cards. The fast path uses a 1:1 tensor split, CUDA P2P, NCCL, Q8_0 paged KV, FlashAttention, MTP, and up to eight resident sequences. The normal llama.cpp codebase is still here, but this profile is deliberately specific to this model and hardware.
+
+## Recommended deployment
+
+Run one Linux `llama-server` process with both GPUs visible. Enable Resizable BAR, verify CUDA P2P read and write access in both directions, and install NCCL before configuring the build. Cooling matters on long prompts. Both cards need enough airflow to hold their normal clocks instead of sitting at the thermal limit.
+
+Use the supplied SM86 release preset:
+
+```bash
+cmake --preset qwen38-3090-release
+cmake --build --preset qwen38-3090-release -j
+```
+
+Start the server with tensor split and P2P enabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+GGML_CUDA_P2P=1 \
+GGML_CUDA_ALLREDUCE=nccl \
+./build-qwen38-3090/bin/llama-server \
+  --model /models/Qwen3.8-27B-Q8_0.gguf \
+  --profile qwen38-27b-q8-2x3090 \
+  --split-mode tensor \
+  --ubatch-size 1024 \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --metrics
+```
+
+The profile fixes the context limit at 262,144 tokens, allows eight resident sequences, keeps K and V cache in Q8_0, enables two-token MTP drafts, and rejects settings that fall outside the tested configuration. Use the pinned model revision and SHA-256 listed in [the deployment notes](docs/qwen38-2x3090.md). The included Docker Compose file is convenient for packaging, but the native command above is the reference deployment and makes driver, NCCL, P2P, and clock checks easier.
+
+## Measured performance
+
+These numbers were measured on August 18, 2026 with the server left running in the configuration above. The model was already loaded and the CUDA graph cache was warm. No server restart is part of the reported timings.
+
+| Workload | Request shape | Result | MTP acceptance |
+| --- | --- | ---: | ---: |
+| Single generation | 1,011 uncached prompt tokens, 256 output tokens | 64.04 output tok/s | 60.43% (139/230) |
+| Multi-turn coding, low reasoning | 3 turns | 80.95 output tok/s | 91.55% (271/296) |
+| 8 concurrent agents | 8 x 4,083 uncached prompt tokens, 8 x 256 output tokens | 124.87 aggregate output tok/s | 59.43% (1,106/1,861) |
+| 8K prefill | 8,181 uncached prompt tokens, 32 output tokens | 1,443.05 prompt tok/s | 60.71% (17/28) |
+| 32K prefill | 32,757 uncached prompt tokens, 256 output tokens | 1,246.15 prompt tok/s | 60.17% (139/231) |
+
+Generation speed starts after the first token. MTP acceptance is accepted draft tokens divided by generated draft tokens.
+
+GPU 1 still reaches its thermal limit during repeated concurrent runs and falls to roughly 1.5 to 1.65 GHz near the end.
+
+## 262K acceptance result
+
+The earlier 262,120-token prompt plus one generated token acceptance run completed in 761.75 seconds and reported 344.17 prompt tokens per second. It was not repeated for the backend-sampling build above. This is a thermal-throttled result, not a clean peak measurement. GPU 1 stayed around 89 to 91 C and repeatedly dropped its core clock during the run. Treat this number as the result of the current cooling setup, not the throughput limit of two RTX 3090 cards holding their normal clocks.
+
+## Upstream llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

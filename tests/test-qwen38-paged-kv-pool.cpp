@@ -29,6 +29,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : invalid paged pool topology\n", __func__);
         return 1;
     }
+    const bool tensor_sharded = model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    if (pool.tensor_sharded() != tensor_sharded) {
+        fprintf(stderr, "%s : paged pool split mode mismatch\n", __func__);
+        return 1;
+    }
 
     int attention_layers = 0;
     for (int32_t il = 0; il < static_cast<int32_t>(model->hparams.n_layer()); ++il) {
@@ -42,7 +47,7 @@ int main(int argc, char ** argv) {
         }
 
         ++attention_layers;
-        if (kv == nullptr || kv->type != GGML_TYPE_Q8_0 || kv->ne[0] != 256 || kv->ne[1] != 16 || kv->ne[2] != 8 || kv->ne[3] != 64) {
+        if (kv == nullptr || kv->type != GGML_TYPE_Q8_0 || kv->ne[0] != 256 || kv->ne[1] != 16 || kv->ne[2] != 64 || kv->ne[3] != 8) {
             fprintf(stderr, "%s : invalid paged tensor for layer %d\n", __func__, il);
             return 1;
         }
@@ -51,7 +56,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s : paged tensor for layer %d is on the wrong device\n", __func__, il);
             return 1;
         }
-        const uint32_t expected_device = il < 36 ? 0 : 1;
+        const uint32_t expected_device = tensor_sharded ? 0 : (il < 36 ? 0 : 1);
         if (pool.device_index(il) != expected_device) {
             fprintf(stderr, "%s : layer %d has device index %u instead of %u\n", __func__, il, pool.device_index(il), expected_device);
             return 1;
@@ -62,6 +67,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    fprintf(stderr, "%s : 16 Q8 paged KV layers follow the 36/28 device boundary\n", __func__);
+    fprintf(stderr, "%s : 16 Q8 paged KV layers use %s placement\n", __func__, tensor_sharded ? "tensor-sharded" : "36/28 layer");
     return 0;
 }

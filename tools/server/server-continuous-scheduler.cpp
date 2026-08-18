@@ -90,7 +90,7 @@ server_schedule_plan server_continuous_scheduler::plan(const std::vector<server_
     const size_t time_budget_aligned = std::max(params.block_size, time_budget / params.block_size * params.block_size);
     const size_t step_multiplier = result.decode_order.empty() ? 4 : 1;
     size_t prefill_cap = std::min(params.max_prefill_chunk, time_budget_aligned * step_multiplier);
-    if (result.decode_order.empty() && prefills.size() >= 2) {
+    if (result.decode_order.empty() && !prefills.empty()) {
         prefill_cap = std::max(prefill_cap, std::min(params.max_prefill_chunk, params.pipeline_prefill_floor));
     }
     budget = std::min(budget, prefill_cap);

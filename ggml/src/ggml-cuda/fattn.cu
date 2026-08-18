@@ -1,10 +1,48 @@
 #include "common.cuh"
+#include "fattn.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
-#include "fattn.cuh"
 
+void ggml_cuda_flash_attn_ext_mma_q8_0_256(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int DKQ = 256;
+    constexpr int DV = 256;
+    constexpr int ncols1 = 8;
+    constexpr int ncols2 = 8;
+    constexpr int ncols = ncols1 * ncols2;
+    constexpr int nstages = 0;
+    constexpr bool V_is_K_view = false;
+
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int nthreads = ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols, cc);
+    const int nbatch_fa = ggml_cuda_fattn_mma_get_nbatch_fa(DKQ, DV, ncols, cc);
+    const int nbatch_K2 = ggml_cuda_fattn_mma_get_nbatch_K2(DKQ, DV, ncols, cc);
+    const int nbatch_V2 = ggml_cuda_fattn_mma_get_nbatch_V2(DKQ, DV, ncols, cc);
+    const int nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
+    const bool Q_in_reg = ggml_cuda_fattn_mma_get_Q_in_reg(DKQ, DV, ncols, cc);
+    const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nwarps = nthreads / warp_size;
+
+    const size_t nbytes_shared_KV = nbatch_fa * std::max(nbatch_K2 + 4, nbatch_V2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_Q = ncols * (DKQ/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_mask = ncols1 * (nbatch_fa/2 + 4) * sizeof(half2);
+    const size_t nbytes_shared_combine = nwarps * cols_per_warp * (nbatch_combine + 4) * sizeof(half2);
+    const size_t nbytes_shared_total = std::max(nbytes_shared_combine,
+        Q_in_reg ? std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) : nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+
+    using kernel_ptr_t = fattn_kernel_t;
+    kernel_ptr_t kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>;
+    static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+    if (!shared_memory_limit_raised[id]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+        shared_memory_limit_raised[id] = true;
+    }
+    GGML_UNUSED(nstages);
+    launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size);
+}
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

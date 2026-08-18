@@ -1,6 +1,412 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+#include <cstring>
+
+static __global__ void gated_delta_net_wy_a_cuda(
+        const float * __restrict__ k,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        float * __restrict__ A) {
+    constexpr int S = 128;
+    constexpr int T = 64;
+    __shared__ float sk[T * S];
+    __shared__ float sg[T];
+    __shared__ float sb[T];
+
+    const int group = blockIdx.x;
+    const float * kg = k + (int64_t) group * T * S;
+    const float * gg = g + (int64_t) group * T;
+    const float * bg = beta + (int64_t) group * T;
+    float * Ag = A + (int64_t) group * T * T;
+
+    for (int i = threadIdx.x; i < T * S; i += blockDim.x) {
+        sk[i] = kg[i];
+    }
+    if (threadIdx.x < T) {
+        sg[threadIdx.x] = gg[threadIdx.x];
+        sb[threadIdx.x] = bg[threadIdx.x];
+    }
+    __syncthreads();
+
+    for (int index = threadIdx.x; index < T * T; index += blockDim.x) {
+        const int i = index / T;
+        const int j = index % T;
+        float value = 0.0f;
+        if (i > j) {
+#pragma unroll 4
+            for (int d = 0; d < S; ++d) {
+                value += sk[i * S + d] * sk[j * S + d];
+            }
+            value *= sb[i] * __expf(sg[i] - sg[j]);
+        }
+        Ag[index] = value;
+    }
+}
+
+static __global__ void gated_delta_net_wy_solve_cuda(
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        const float * __restrict__ A,
+        float * __restrict__ W,
+        float * __restrict__ U) {
+    constexpr int S = 128;
+    constexpr int T = 64;
+    __shared__ float sA[T * T];
+    __shared__ float sy[T * S];
+
+    const int group = blockIdx.x;
+    const int kind = blockIdx.y;
+    const int d = threadIdx.x;
+    const float * Ag = A + (int64_t) group * T * T;
+    for (int i = threadIdx.x; i < T * T; i += blockDim.x) {
+        sA[i] = Ag[i];
+    }
+    __syncthreads();
+
+    const float * input = kind == 0 ? k : v;
+    const float * ig = input + (int64_t) group * T * S;
+    const float * gg = g + (int64_t) group * T;
+    const float * bg = beta + (int64_t) group * T;
+    float * output = (kind == 0 ? W : U) + (int64_t) group * T * S;
+
+    for (int i = 0; i < T; ++i) {
+        float value = bg[i] * ig[i * S + d];
+        if (kind == 0) {
+            value *= __expf(gg[i]);
+        }
+        for (int j = 0; j < i; ++j) {
+            value -= sA[i * T + j] * sy[j * S + d];
+        }
+        sy[i * S + d] = value;
+        output[i * S + d] = value;
+    }
+}
+
+static __global__ void gated_delta_net_chunk_copy_cuda(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        int matrix_elements,
+        int n_chunks,
+        int chunk) {
+    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= matrix_elements) {
+        return;
+    }
+    const int head = blockIdx.y;
+    dst[(int64_t) head * matrix_elements + index] = src[(int64_t) head * matrix_elements * n_chunks + (int64_t) chunk * matrix_elements + index];
+}
+
+static __global__ void gated_delta_net_chunk_scale_state_cuda(
+        float * __restrict__ state,
+        const float * __restrict__ scale,
+        int state_elements,
+        int n_chunks,
+        int chunk) {
+    const int64_t index = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= state_elements) {
+        return;
+    }
+    const int head = blockIdx.y;
+    state[(int64_t) head * state_elements + index] *= scale[(int64_t) head * n_chunks + chunk];
+}
+
+static __global__ void gated_delta_net_chunk_pack_cuda(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        float * __restrict__ q_pack,
+        float * __restrict__ k_pack,
+        float * __restrict__ v_pack,
+        float * __restrict__ g_cumsum,
+        float * __restrict__ beta_pack,
+        int S,
+        int T,
+        int n_tokens,
+        int n_chunks,
+        int H_k,
+        int H_v) {
+    const int group = blockIdx.x;
+    const int head = group / n_chunks;
+    const int chunk = group % n_chunks;
+    const int sequence = head / H_v;
+    const int v_head = head % H_v;
+    const int k_head = v_head % H_k;
+    const int begin = chunk * T;
+    const int64_t st = (int64_t) S * T;
+    const float scale = rsqrtf((float) S);
+
+    for (int index = threadIdx.x; index < S * T; index += blockDim.x) {
+        const int token_in_chunk = index / S;
+        const int dim = index % S;
+        const int token = begin + token_in_chunk;
+        float qv = 0.0f;
+        float kv = 0.0f;
+        float vv = 0.0f;
+        if (token < n_tokens) {
+            qv = q[((int64_t) sequence * n_tokens * H_k + (int64_t) token * H_k + k_head) * S + dim] * scale;
+            kv = k[((int64_t) sequence * n_tokens * H_k + (int64_t) token * H_k + k_head) * S + dim];
+            vv = v[((int64_t) sequence * n_tokens * H_v + (int64_t) token * H_v + v_head) * S + dim];
+        }
+        q_pack[(int64_t) group * st + index] = qv;
+        k_pack[(int64_t) group * st + index] = kv;
+        v_pack[(int64_t) group * st + index] = vv;
+    }
+    if (threadIdx.x == 0) {
+        float cumulative = 0.0f;
+        for (int token_in_chunk = 0; token_in_chunk < T; ++token_in_chunk) {
+            const int token = begin + token_in_chunk;
+            float bv = 0.0f;
+            if (token < n_tokens) {
+                const int64_t index = (int64_t) sequence * n_tokens * H_v + (int64_t) token * H_v + v_head;
+                cumulative += g[index];
+                bv = beta[index];
+            }
+            g_cumsum[(int64_t) group * T + token_in_chunk] = cumulative;
+            beta_pack[(int64_t) group * T + token_in_chunk] = bv;
+        }
+    }
+}
+
+static __global__ void gated_delta_net_chunk_transform_cuda(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ u,
+        const float * __restrict__ g,
+        float * __restrict__ q_g,
+        float * __restrict__ kg_t,
+        float * __restrict__ v_t,
+        float * __restrict__ g_last,
+        int S,
+        int T) {
+    const int group = blockIdx.x;
+    const int64_t st = (int64_t) S * T;
+    const float last = g[(int64_t) group * T + T - 1];
+    if (threadIdx.x == 0) {
+        g_last[group] = __expf(last);
+    }
+    for (int index = threadIdx.x; index < S * T; index += blockDim.x) {
+        const int token = index / S;
+        const int dim = index % S;
+        const float gt = g[(int64_t) group * T + token];
+        q_g[(int64_t) group * st + index] = q[(int64_t) group * st + index] * __expf(gt);
+        kg_t[(int64_t) group * st + (int64_t) dim * T + token] = k[(int64_t) group * st + index] * __expf(last - gt);
+        v_t[(int64_t) group * st + (int64_t) dim * T + token] = u[(int64_t) group * st + index];
+    }
+}
+
+static __global__ void gated_delta_net_chunk_mask_kq_cuda(
+        float * __restrict__ kq,
+        const float * __restrict__ g,
+        int T) {
+    const int group = blockIdx.x;
+    for (int index = threadIdx.x; index < T * T; index += blockDim.x) {
+        const int key = index % T;
+        const int query = index / T;
+        float value = 0.0f;
+        if (key <= query) {
+            value = kq[(int64_t) group * T * T + key + query * T] * __expf(g[(int64_t) group * T + query] - g[(int64_t) group * T + key]);
+        }
+        kq[(int64_t) group * T * T + key + query * T] = value;
+    }
+}
+
+static void gated_delta_net_init_tensor(
+        ggml_tensor & tensor,
+        void * data,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        int64_t ne3) {
+    memset(&tensor, 0, sizeof(tensor));
+    tensor.type = GGML_TYPE_F32;
+    tensor.data = data;
+    tensor.ne[0] = ne0;
+    tensor.ne[1] = ne1;
+    tensor.ne[2] = ne2;
+    tensor.ne[3] = ne3;
+    tensor.nb[0] = sizeof(float);
+    tensor.nb[1] = ne0 * sizeof(float);
+    tensor.nb[2] = tensor.nb[1] * ne1;
+    tensor.nb[3] = tensor.nb[2] * ne2;
+}
+
+static void gated_delta_net_chunk_gemm(
+        cublasHandle_t handle,
+        cublasOperation_t trans_a,
+        cublasOperation_t trans_b,
+        int m,
+        int n,
+        int k,
+        float alpha,
+        const float * a,
+        int lda,
+        int64_t stride_a,
+        const float * b,
+        int ldb,
+        int64_t stride_b,
+        float beta,
+        float * c,
+        int ldc,
+        int64_t stride_c,
+        int batch_count) {
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+        handle, trans_a, trans_b, m, n, k,
+        &alpha, a, CUDA_R_32F, lda, stride_a,
+        b, CUDA_R_32F, ldb, stride_b,
+        &beta, c, CUDA_R_32F, ldc, stride_c,
+        batch_count, CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+static void gated_delta_net_chunk_scan_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * k_cd = dst->src[0];
+    const ggml_tensor * v_t = dst->src[1];
+    const ggml_tensor * kq = dst->src[2];
+    const ggml_tensor * q_g = dst->src[3];
+    const ggml_tensor * kg_t = dst->src[4];
+    const ggml_tensor * g_last = dst->src[5];
+    const ggml_tensor * state_in = dst->src[6];
+
+    const int S = k_cd->ne[0];
+    const int T = k_cd->ne[1];
+    const int n_chunks = k_cd->ne[2];
+    const int H = k_cd->ne[3];
+    const int output_matrix = S * T;
+    const int state_matrix = S * S;
+    const int vprime_matrix = T * S;
+    float * output = static_cast<float *>(dst->data);
+    float * state = output + (int64_t) output_matrix * n_chunks * H;
+    float * vprime = state + (int64_t) state_matrix * H;
+    cudaStream_t stream = ctx.stream();
+    CUDA_CHECK(cudaMemcpyAsync(state, state_in->data, (size_t) state_matrix * H * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+
+    const float * k_cd_data = static_cast<const float *>(k_cd->data);
+    const float * v_t_data = static_cast<const float *>(v_t->data);
+    const float * kq_data = static_cast<const float *>(kq->data);
+    const float * q_g_data = static_cast<const float *>(q_g->data);
+    const float * kg_t_data = static_cast<const float *>(kg_t->data);
+    const float * g_last_data = static_cast<const float *>(g_last->data);
+    constexpr int threads = 256;
+
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        gated_delta_net_chunk_copy_cuda<<<dim3((vprime_matrix + threads - 1) / threads, H), threads, 0, stream>>>(
+            v_t_data, vprime, vprime_matrix, n_chunks, chunk);
+        gated_delta_net_chunk_gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            T, S, S, -1.0f,
+            k_cd_data + (int64_t) chunk * output_matrix, S, (int64_t) output_matrix * n_chunks,
+            state, S, state_matrix,
+            1.0f, vprime, T, vprime_matrix, H);
+
+        float * output_chunk = output + (int64_t) chunk * output_matrix;
+        gated_delta_net_chunk_gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            S, T, S, 1.0f,
+            state, S, state_matrix,
+            q_g_data + (int64_t) chunk * output_matrix, S, (int64_t) output_matrix * n_chunks,
+            0.0f, output_chunk, S, (int64_t) output_matrix * n_chunks, H);
+        gated_delta_net_chunk_gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            S, T, T, 1.0f,
+            vprime, T, vprime_matrix,
+            kq_data + (int64_t) chunk * T * T, T, (int64_t) T * T * n_chunks,
+            1.0f, output_chunk, S, (int64_t) output_matrix * n_chunks, H);
+
+        gated_delta_net_chunk_scale_state_cuda<<<dim3((state_matrix + threads - 1) / threads, H), threads, 0, stream>>>(
+            state, g_last_data, state_matrix, n_chunks, chunk);
+        gated_delta_net_chunk_gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            S, S, T, 1.0f,
+            kg_t_data + (int64_t) chunk * vprime_matrix, T, (int64_t) vprime_matrix * n_chunks,
+            vprime, T, vprime_matrix,
+            1.0f, state, S, state_matrix, H);
+    }
+}
+
+static void gated_delta_net_chunk_fused_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * g = dst->src[3];
+    const ggml_tensor * beta = dst->src[4];
+    const ggml_tensor * state_in = dst->src[5];
+    const int S = q->ne[0];
+    const int H_k = q->ne[1];
+    const int n_tokens = q->ne[2];
+    const int n_sequences = q->ne[3];
+    const int H_v = v->ne[1];
+    const int H = H_v * n_sequences;
+    const int T = ggml_get_op_params_i32(dst, 2);
+    const int n_chunks = (n_tokens + T - 1) / T;
+    const int groups = H * n_chunks;
+    const int64_t st = (int64_t) S * T;
+    const int64_t tt = (int64_t) T * T;
+    const int64_t output_elements = groups * st;
+    const int64_t state_elements = (int64_t) H * S * S;
+    const int64_t scan_scratch = (int64_t) H * st;
+    float * cursor = static_cast<float *>(dst->data) + output_elements + state_elements + scan_scratch;
+    float * q_pack = cursor; cursor += groups * st;
+    float * k_pack = cursor; cursor += groups * st;
+    float * v_pack = cursor; cursor += groups * st;
+    float * g_pack = cursor; cursor += (int64_t) groups * T;
+    float * b_pack = cursor; cursor += (int64_t) groups * T;
+    float * A = cursor; cursor += groups * tt;
+    float * W = cursor; cursor += groups * st;
+    float * U = cursor; cursor += groups * st;
+    float * KQ = cursor; cursor += groups * tt;
+    float * QG = cursor; cursor += groups * st;
+    float * KGT = cursor; cursor += groups * st;
+    float * VT = cursor; cursor += groups * st;
+    float * GLast = cursor; cursor += groups;
+    GGML_ASSERT(cursor <= static_cast<float *>(dst->data) + ggml_nelements(dst));
+
+    cudaStream_t stream = ctx.stream();
+    gated_delta_net_chunk_pack_cuda<<<groups, 256, 0, stream>>>(
+        static_cast<const float *>(q->data), static_cast<const float *>(k->data), static_cast<const float *>(v->data),
+        static_cast<const float *>(g->data), static_cast<const float *>(beta->data),
+        q_pack, k_pack, v_pack, g_pack, b_pack, S, T, n_tokens, n_chunks, H_k, H_v);
+    gated_delta_net_wy_a_cuda<<<groups, 256, 0, stream>>>(k_pack, g_pack, b_pack, A);
+    gated_delta_net_wy_solve_cuda<<<dim3(groups, 2), 128, 0, stream>>>(k_pack, v_pack, g_pack, b_pack, A, W, U);
+
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+    gated_delta_net_chunk_gemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        T, T, S, 1.0f,
+        k_pack, S, st,
+        q_pack, S, st,
+        0.0f, KQ, T, tt, groups);
+    gated_delta_net_chunk_mask_kq_cuda<<<groups, 256, 0, stream>>>(KQ, g_pack, T);
+    gated_delta_net_chunk_transform_cuda<<<groups, 256, 0, stream>>>(
+        q_pack, k_pack, U, g_pack, QG, KGT, VT, GLast, S, T);
+
+    ggml_tensor kcd_tensor;
+    ggml_tensor vt_tensor;
+    ggml_tensor kq_tensor;
+    ggml_tensor qg_tensor;
+    ggml_tensor kgt_tensor;
+    ggml_tensor glast_tensor;
+    ggml_tensor state_tensor = *state_in;
+    ggml_tensor scan_dst = *dst;
+    gated_delta_net_init_tensor(kcd_tensor, W, S, T, n_chunks, H);
+    gated_delta_net_init_tensor(vt_tensor, VT, T, S, n_chunks, H);
+    gated_delta_net_init_tensor(kq_tensor, KQ, T, T, n_chunks, H);
+    gated_delta_net_init_tensor(qg_tensor, QG, S, T, n_chunks, H);
+    gated_delta_net_init_tensor(kgt_tensor, KGT, T, S, n_chunks, H);
+    gated_delta_net_init_tensor(glast_tensor, GLast, 1, 1, n_chunks, H);
+    scan_dst.src[0] = &kcd_tensor;
+    scan_dst.src[1] = &vt_tensor;
+    scan_dst.src[2] = &kq_tensor;
+    scan_dst.src[3] = &qg_tensor;
+    scan_dst.src[4] = &kgt_tensor;
+    scan_dst.src[5] = &glast_tensor;
+    scan_dst.src[6] = &state_tensor;
+    gated_delta_net_chunk_scan_cuda(ctx, &scan_dst);
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -222,6 +628,35 @@ static void launch_gated_delta_net(
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
+    if (ggml_get_op_params_i32(dst, 1) == 3) {
+        GGML_ASSERT(cache == nullptr);
+        gated_delta_net_chunk_fused_cuda(ctx, dst);
+        return;
+    }
+    if (ggml_get_op_params_i32(dst, 1) == 1) {
+        const ggml_tensor * src_k = dst->src[0];
+        const ggml_tensor * src_v = dst->src[1];
+        const ggml_tensor * src_g = dst->src[2];
+        const ggml_tensor * src_b = dst->src[3];
+        GGML_ASSERT(src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32);
+        GGML_ASSERT(src_g->type == GGML_TYPE_F32 && src_b->type == GGML_TYPE_F32);
+        GGML_ASSERT(src_k->ne[0] == 128 && src_k->ne[1] == 64);
+        GGML_ASSERT(ggml_are_same_shape(src_k, src_v));
+        const int64_t n_groups = src_k->ne[2] * src_k->ne[3];
+        const int64_t a_elements = n_groups * 64 * 64;
+        const int64_t wu_elements = n_groups * 64 * 128;
+        float * A = (float *) dst->data;
+        float * W = A + a_elements;
+        float * U = W + wu_elements;
+        cudaStream_t stream = ctx.stream();
+        gated_delta_net_wy_a_cuda<<<n_groups, 256, 0, stream>>>(
+            (const float *) src_k->data, (const float *) src_g->data, (const float *) src_b->data, A);
+        gated_delta_net_wy_solve_cuda<<<dim3(n_groups, 2), 128, 0, stream>>>(
+            (const float *) src_k->data, (const float *) src_v->data,
+            (const float *) src_g->data, (const float *) src_b->data, A, W, U);
+        return;
+    }
+
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];

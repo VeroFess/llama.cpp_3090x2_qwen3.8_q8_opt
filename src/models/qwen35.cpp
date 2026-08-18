@@ -323,20 +323,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     if (inp->get_paged()) {
         auto * paged = inp->get_paged();
         const llama_paged_kv_pool * pool = paged->mctx->get_paged_pool();
-        const uint32_t device = pool->device_index(il);
+        const uint32_t device = pool->tensor_sharded() ? 0 : pool->device_index(il);
         Qcur = ggml_cont(ctx0, Qcur);
         Kcur = ggml_cont(ctx0, Kcur);
         Vcur = ggml_cont(ctx0, Vcur);
-        const llama_paged_kv_metadata * metadata = paged->mctx->get_paged_metadata();
-        int32_t context_tokens = static_cast<int32_t>(pool->n_pages() * pool->page_size());
-        if (metadata && !metadata->context_lens.empty()) {
-            context_tokens = *std::max_element(metadata->context_lens.begin(), metadata->context_lens.end());
-        }
-        const int32_t partitions = context_tokens <= 4096 ? 1 : context_tokens <= 32768 ? 4 : context_tokens <= 131072 ? 8 : 16;
         cur = ggml_qwen38_paged_attn(
             ctx0, Qcur, Kcur, Vcur, pool->get_kv(il),
             paged->block_tables[device], paged->write_slots[device], paged->context_lens,
-            paged->batch_offsets, paged->batch_lens, kq_scale, pool->page_size(), paged->block_tables[device]->ne[0], partitions);
+            paged->batch_offsets, paged->batch_lens, paged->scratch, kq_scale, pool->page_size(), paged->block_tables[device]->ne[0], paged->partitions,
+            paged->context_tokens, paged->contiguous_starts[device]);
         cur = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tokens);
     } else {
         cur = build_attn(inp->get_attn(),

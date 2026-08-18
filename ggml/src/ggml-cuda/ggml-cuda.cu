@@ -1791,6 +1791,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // cuBLAS rejects zero-sized speculative tensor slices.
+    if (ne00 == 0 || ne01 == 0 || ne10 == 0 || ne11 == 0 || ne0 == 0 || ne12 == 0 || ne13 == 0) {
+        return;
+    }
+
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));

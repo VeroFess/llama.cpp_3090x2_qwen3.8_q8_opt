@@ -360,6 +360,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    const bool qwen38_mirrored_output =
+        ud->n_devices == 2 &&
+        ud->model->arch == LLM_ARCH_QWEN35 &&
+        hparams.n_layer() == 64 &&
+        hparams.n_embd == 5120 &&
+        hparams.n_ctx_train == 262144 &&
+        hparams.n_layer_nextn >= 1;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -369,6 +376,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_paged_kv_cache  ("paged_kv_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
@@ -428,6 +436,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
             rotation = get_il_eff(il) % ud->n_devices;
+        } else if (tensor_name.substr(0, 9) == "paged_kv_") {
+            const size_t layer_index_start = tensor_name.rfind("_l");
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            prefix = "blk." + std::to_string(il) + ".";
+            rotation = get_il_eff(il) % ud->n_devices;
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
@@ -466,6 +480,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_paged_kv_cache)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_3);
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -516,12 +533,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(qwen38_mirrored_output ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(qwen38_mirrored_output ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_0);
         }
 
         // everything else
@@ -536,6 +553,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t n_v_heads  = hparams.ssm_dt_rank;
             const int64_t key_dim    = head_k_dim * n_k_heads;
             const int64_t value_dim  = head_v_dim * n_v_heads;
+
+            if (std::regex_match(tensor_name, pattern_paged_kv_cache)) {
+                return {{hparams.n_head_kv(il), 2}};
+            }
 
             // both Qwen 3 Next and Qwen 3.5 support n_v_heads > n_k_heads but the broadcasting pattern is different:
             //   - Qwen 3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] (this is the default split pattern)

@@ -1,5 +1,6 @@
 #include "llama-paged-kv-pool.h"
 
+#include "../ggml/src/ggml-backend-impl.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -14,6 +15,52 @@
 static constexpr uint32_t LLAMA_PAGED_KV_STATE_MAGIC = 0x51504b56;
 static constexpr uint32_t LLAMA_PAGED_KV_SEQUENCE_STATE_VERSION = 1;
 static constexpr uint32_t LLAMA_PAGED_KV_FULL_STATE_VERSION = 2;
+
+static uint64_t llama_paged_kv_page_bytes(const ggml_tensor * kv) {
+    return kv->nb[2] * kv->ne[3];
+}
+
+static void llama_paged_kv_write_page(
+        llama_io_write_i & io,
+              ggml_tensor * kv,
+        const std::array<uint32_t, 2> & physical,
+                  uint32_t device) {
+    if (ggml_backend_buffer_is_meta(kv->buffer)) {
+        const size_t count = ggml_backend_meta_buffer_n_bufs(kv->buffer);
+        GGML_ASSERT(count == 2);
+        for (size_t shard = 0; shard < count; ++shard) {
+            ggml_tensor * local = ggml_backend_meta_buffer_simple_tensor(kv, shard);
+            for (int64_t head = 0; head < local->ne[3]; ++head) {
+                io.write_tensor(local, head * local->nb[3] + static_cast<size_t>(physical[shard]) * local->nb[2], local->nb[2]);
+            }
+        }
+        return;
+    }
+    for (int64_t head = 0; head < kv->ne[3]; ++head) {
+        io.write_tensor(kv, head * kv->nb[3] + static_cast<size_t>(physical[device]) * kv->nb[2], kv->nb[2]);
+    }
+}
+
+static void llama_paged_kv_read_page(
+        llama_io_read_i & io,
+              ggml_tensor * kv,
+        const std::array<uint32_t, 2> & physical,
+                  uint32_t device) {
+    if (ggml_backend_buffer_is_meta(kv->buffer)) {
+        const size_t count = ggml_backend_meta_buffer_n_bufs(kv->buffer);
+        GGML_ASSERT(count == 2);
+        for (size_t shard = 0; shard < count; ++shard) {
+            ggml_tensor * local = ggml_backend_meta_buffer_simple_tensor(kv, shard);
+            for (int64_t head = 0; head < local->ne[3]; ++head) {
+                io.read_tensor(local, head * local->nb[3] + static_cast<size_t>(physical[shard]) * local->nb[2], local->nb[2]);
+            }
+        }
+        return;
+    }
+    for (int64_t head = 0; head < kv->ne[3]; ++head) {
+        io.read_tensor(kv, head * kv->nb[3] + static_cast<size_t>(physical[device]) * kv->nb[2], kv->nb[2]);
+    }
+}
 
 llama_paged_kv_pool::llama_paged_kv_pool(
         const llama_model & model,
@@ -62,12 +109,32 @@ llama_paged_kv_pool::llama_paged_kv_pool(
         if (dev == nullptr) {
             throw std::runtime_error("paged KV layer has no backend device");
         }
-        auto device = std::find(devices.begin(), devices.end(), dev);
-        if (device == devices.end()) {
-            devices.push_back(dev);
-            device = std::prev(devices.end());
+        uint32_t device_id = 0;
+        if (ggml_backend_dev_is_meta(dev)) {
+            const size_t count = ggml_backend_meta_dev_n_devs(dev);
+            if (count != 2) {
+                throw std::runtime_error("Qwen3.8 tensor-paged KV requires two devices");
+            }
+            if (!is_tensor_sharded) {
+                if (!devices.empty()) {
+                    throw std::runtime_error("paged KV cannot mix tensor and layer placement");
+                }
+                is_tensor_sharded = true;
+                for (size_t shard = 0; shard < count; ++shard) {
+                    devices.push_back(ggml_backend_meta_dev_simple_dev(dev, shard));
+                }
+            }
+        } else {
+            if (is_tensor_sharded) {
+                throw std::runtime_error("paged KV cannot mix tensor and layer placement");
+            }
+            auto device = std::find(devices.begin(), devices.end(), dev);
+            if (device == devices.end()) {
+                devices.push_back(dev);
+                device = std::prev(devices.end());
+            }
+            device_id = static_cast<uint32_t>(std::distance(devices.begin(), device));
         }
-        const uint32_t device_id = static_cast<uint32_t>(std::distance(devices.begin(), device));
         if (device_id >= 2) {
             throw std::runtime_error("Qwen3.8 paged KV requires at most two devices");
         }
@@ -85,7 +152,7 @@ llama_paged_kv_pool::llama_paged_kv_pool(
             throw std::runtime_error("unsupported paged KV head layout");
         }
 
-        ggml_tensor * kv = ggml_new_tensor_4d(ctx, type, head_dim_k, block_size, 2 * n_head_kv, block_count);
+        ggml_tensor * kv = ggml_new_tensor_4d(ctx, type, head_dim_k, block_size, block_count, 2 * n_head_kv);
         ggml_format_name(kv, "paged_kv_l%d", il);
         layer_map[il] = layers.size();
         layers.push_back({ static_cast<int32_t>(il), device_id, kv });
@@ -127,6 +194,10 @@ uint32_t llama_paged_kv_pool::n_devices() const {
     return devices.size();
 }
 
+bool llama_paged_kv_pool::tensor_sharded() const {
+    return is_tensor_sharded;
+}
+
 uint32_t llama_paged_kv_pool::page_size() const {
     return block_size;
 }
@@ -153,12 +224,19 @@ void llama_paged_kv_pool::clear() {
 void llama_paged_kv_pool::copy_pages(const std::vector<llama_paged_block_copy> & copies) const {
     for (const auto & copy : copies) {
         for (const auto & value : layers) {
-            const size_t page_bytes = value.kv->nb[3];
-            std::vector<uint8_t> staging(page_bytes);
-            const size_t source_offset = static_cast<size_t>(copy.source.physical[value.device]) * page_bytes;
-            const size_t destination_offset = static_cast<size_t>(copy.destination.physical[value.device]) * page_bytes;
-            ggml_backend_tensor_get(value.kv, staging.data(), source_offset, page_bytes);
-            ggml_backend_tensor_set(value.kv, staging.data(), destination_offset, page_bytes);
+            const size_t count = ggml_backend_buffer_is_meta(value.kv->buffer) ? ggml_backend_meta_buffer_n_bufs(value.kv->buffer) : 1;
+            for (size_t shard = 0; shard < count; ++shard) {
+                ggml_tensor * local = count == 1 ? value.kv : ggml_backend_meta_buffer_simple_tensor(value.kv, shard);
+                const uint32_t physical_device = count == 1 ? value.device : shard;
+                const size_t head_page_bytes = local->nb[2];
+                std::vector<uint8_t> staging(head_page_bytes);
+                for (int64_t head = 0; head < local->ne[3]; ++head) {
+                    const size_t source_offset = head * local->nb[3] + static_cast<size_t>(copy.source.physical[physical_device]) * head_page_bytes;
+                    const size_t destination_offset = head * local->nb[3] + static_cast<size_t>(copy.destination.physical[physical_device]) * head_page_bytes;
+                    ggml_backend_tensor_get(local, staging.data(), source_offset, head_page_bytes);
+                    ggml_backend_tensor_set(local, staging.data(), destination_offset, head_page_bytes);
+                }
+            }
         }
     }
 }
@@ -198,7 +276,7 @@ void llama_paged_kv_pool::state_write(
         io.write(&unique_page_count, sizeof(unique_page_count));
         io.write(&layer_count, sizeof(layer_count));
         for (const auto & value : layers) {
-            const uint64_t page_bytes = value.kv->nb[3];
+            const uint64_t page_bytes = llama_paged_kv_page_bytes(value.kv);
             io.write(&value.il, sizeof(value.il));
             io.write(&page_bytes, sizeof(page_bytes));
         }
@@ -216,9 +294,8 @@ void llama_paged_kv_pool::state_write(
             }
         }
         for (const auto & value : layers) {
-            const uint64_t page_bytes = value.kv->nb[3];
             for (const auto & page : unique_pages) {
-                io.write_tensor(value.kv, static_cast<size_t>(page.physical[value.device]) * page_bytes, page_bytes);
+                llama_paged_kv_write_page(io, value.kv, page.physical, value.device);
             }
         }
         return;
@@ -234,11 +311,11 @@ void llama_paged_kv_pool::state_write(
     io.write(&page_count, sizeof(page_count));
     io.write(&layer_count, sizeof(layer_count));
     for (const auto & value : layers) {
-        const uint64_t page_bytes = value.kv->nb[3];
+        const uint64_t page_bytes = llama_paged_kv_page_bytes(value.kv);
         io.write(&value.il, sizeof(value.il));
         io.write(&page_bytes, sizeof(page_bytes));
         for (const auto & page : table) {
-            io.write_tensor(value.kv, static_cast<size_t>(page.physical[value.device]) * page_bytes, page_bytes);
+            llama_paged_kv_write_page(io, value.kv, page.physical, value.device);
         }
     }
 }
@@ -273,7 +350,7 @@ void llama_paged_kv_pool::state_read(
             uint64_t page_bytes;
             io.read(&saved_layer, sizeof(saved_layer));
             io.read(&page_bytes, sizeof(page_bytes));
-            if (saved_layer != value.il || page_bytes != value.kv->nb[3]) {
+            if (saved_layer != value.il || page_bytes != llama_paged_kv_page_bytes(value.kv)) {
                 throw std::runtime_error("paged KV full-state layer metadata mismatch");
             }
         }
@@ -309,9 +386,8 @@ void llama_paged_kv_pool::state_read(
         }
         try {
             for (const auto & value : layers) {
-                const uint64_t page_bytes = value.kv->nb[3];
                 for (const auto & page : restored_pages) {
-                    io.read_tensor(value.kv, static_cast<size_t>(page.physical[value.device]) * page_bytes, page_bytes);
+                    llama_paged_kv_read_page(io, value.kv, page.physical, value.device);
                 }
             }
         } catch (...) {
@@ -351,11 +427,11 @@ void llama_paged_kv_pool::state_read(
             uint64_t page_bytes;
             io.read(&saved_layer, sizeof(saved_layer));
             io.read(&page_bytes, sizeof(page_bytes));
-            if (saved_layer != value.il || page_bytes != value.kv->nb[3]) {
+            if (saved_layer != value.il || page_bytes != llama_paged_kv_page_bytes(value.kv)) {
                 throw std::runtime_error("paged KV layer metadata mismatch");
             }
             for (const auto & page : table) {
-                io.read_tensor(value.kv, static_cast<size_t>(page.physical[value.device]) * page_bytes, page_bytes);
+                llama_paged_kv_read_page(io, value.kv, page.physical, value.device);
             }
         }
     } catch (...) {

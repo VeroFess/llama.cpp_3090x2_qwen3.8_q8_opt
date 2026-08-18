@@ -1903,14 +1903,14 @@ private:
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
-            task.params.sampling.backend_sampling = use_backend_sampling;
 
             // TODO: tmp until backend sampling is fully implemented
             if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+                use_backend_sampling = llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
+            task.params.sampling.backend_sampling = use_backend_sampling;
             slot.backend_sampling_active = use_backend_sampling;
             if (backend_sampling_requested && !use_backend_sampling) {
                 ++metrics.gpu_sampling_fallbacks;
@@ -4831,6 +4831,14 @@ void server_routes::init_routes() {
         }
         const auto page_stats = ctx_server.qwen38_page_stats();
         const auto watchdog = ctx_server.qwen38_watchdog_status();
+        const bool tensor_mode = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+        json layer_boundary = nullptr;
+        if (!tensor_mode) {
+            layer_boundary = {
+                {"gpu0", params.qwen38_layer_boundary},
+                {"gpu1", 64 - params.qwen38_layer_boundary},
+            };
+        }
         res->ok({
             {"profile", params.deployment_profile},
             {"max_model_len", params.n_ctx},
@@ -4851,11 +4859,9 @@ void server_routes::init_routes() {
             }},
             {"kv_cache_type_k", ggml_type_name(params.cache_type_k)},
             {"kv_cache_type_v", ggml_type_name(params.cache_type_v)},
-            {"split_mode", "layer"},
-            {"layer_boundary", {
-                {"gpu0", params.qwen38_layer_boundary},
-                {"gpu1", 64 - params.qwen38_layer_boundary},
-            }},
+            {"split_mode", tensor_mode ? "tensor" : "layer"},
+            {"layer_boundary", layer_boundary},
+            {"tensor_split", tensor_mode ? json::array({1, 1}) : json(nullptr)},
             {"transfer_mode", params.cuda_p2p_active ? "cuda_peer" : "pinned_host_staged"},
             {"speculative_types", common_speculative_type_name_str(params.speculative.types)},
             {"mtp_max_draft", params.speculative.draft.n_max},
@@ -5698,6 +5704,7 @@ json server_routes::get_model_info() const {
     };
 
     if (server_qwen38_profile_enabled(params)) {
+        const bool tensor_mode = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
         info["meta"]["deployment_profile"] = params.deployment_profile;
         info["meta"]["model_sha256"] = params.model_sha256;
         info["meta"]["kv_cache_type_k"] = ggml_type_name(params.cache_type_k);
@@ -5707,10 +5714,12 @@ json server_routes::get_model_info() const {
         info["meta"]["max_resident_tokens"] = params.n_ctx;
         info["meta"]["kv_page_size"] = params.kv_page_size;
         info["meta"]["kv_paged_storage"] = params.kv_paged_storage;
-        info["meta"]["layer_boundary"] = {
+        info["meta"]["split_mode"] = tensor_mode ? "tensor" : "layer";
+        info["meta"]["layer_boundary"] = tensor_mode ? json(nullptr) : json({
             {"gpu0", params.qwen38_layer_boundary},
             {"gpu1", 64 - params.qwen38_layer_boundary},
-        };
+        });
+        info["meta"]["tensor_split"] = tensor_mode ? json::array({1, 1}) : json(nullptr);
         info["meta"]["transfer_mode"] = params.cuda_p2p_active ? "cuda_peer" : "pinned_host_staged";
         info["meta"]["speculative_types"] = common_speculative_type_name_str(params.speculative.types);
         info["meta"]["mtp_max_draft"] = params.speculative.draft.n_max;

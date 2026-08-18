@@ -637,6 +637,10 @@ public:
     ggml_tensor * context_lens = nullptr;
     ggml_tensor * batch_offsets = nullptr;
     ggml_tensor * batch_lens = nullptr;
+    ggml_tensor * scratch = nullptr;
+    int32_t partitions = 1;
+    int32_t context_tokens = 0;
+    std::array<int32_t, 2> contiguous_starts = { -1, -1 };
 
     const llama_memory_hybrid_context * mctx;
 };

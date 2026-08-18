@@ -14,6 +14,10 @@ services:
       NVIDIA_VISIBLE_DEVICES: "0,1"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       CUDA_VISIBLE_DEVICES: "0,1"
+      GGML_CUDA_P2P: "1"
+      GGML_CUDA_ALLREDUCE: "nccl"
+      NCCL_DEBUG: "WARN"
+      LLAMA_CUDA_WATCHDOG_MS: "300000"
     volumes:
       - type: bind
         source: ${QWEN38_MODEL}
@@ -24,9 +28,14 @@ services:
       - /models/Qwen3.8-27B-Q8_0.gguf
       - --profile
       - qwen38-27b-q8-2x3090
+      - --split-mode
+      - tensor
+      - --ubatch-size
+      - "1024"
       - --host
       - 0.0.0.0
       - --port
       - "8080"
+      - --no-webui
+      - --metrics
     restart: unless-stopped
-

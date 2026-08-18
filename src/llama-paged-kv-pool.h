@@ -36,6 +36,7 @@ public:
     ggml_tensor * get_kv(int32_t il) const;
     uint32_t device_index(int32_t il) const;
     uint32_t n_devices() const;
+    bool tensor_sharded() const;
     uint32_t page_size() const;
     uint32_t n_pages() const;
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
@@ -53,6 +54,7 @@ private:
 
     uint32_t block_size = 0;
     uint32_t block_count = 0;
+    bool is_tensor_sharded = false;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<layer> layers;
     std::map<int32_t, size_t> layer_map;
