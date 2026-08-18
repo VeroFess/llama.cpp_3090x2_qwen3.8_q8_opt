@@ -172,14 +172,13 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                     if (ubatch.pos[i] < 0) {
                         continue;
                     }
-                    const size_t tokens = static_cast<size_t>(ubatch.pos[i]) + 1;
                     for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
                         const int sequence_id = ubatch.seq_id[i][j];
                         auto running = running_tokens.find(sequence_id);
                         if (running == running_tokens.end()) {
                             running = running_tokens.emplace(sequence_id, block_manager->token_count(sequence_id)).first;
                         }
-                        running->second = std::max(running->second, tokens);
+                        ++running->second;
                         requests[sequence_id] = running->second;
                     }
                 }
@@ -229,6 +228,9 @@ void llama_memory_hybrid::clear(bool data) {
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const size_t tokens_before = block_manager && seq_id >= 0 ? block_manager->token_count(seq_id) : 0;
+    const llama_pos pos_before = block_manager && seq_id >= 0 ? mem_recr->seq_pos_max(seq_id) : -1;
+
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
@@ -243,8 +245,14 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
                 block_manager->clear();
             }
         } else {
-            const llama_pos pos_max = seq_pos_max(seq_id);
-            if (!block_manager->reserve(seq_id, pos_max < 0 ? 0 : static_cast<size_t>(pos_max) + 1)) {
+            const llama_pos pos_max = mem_recr->seq_pos_max(seq_id);
+            size_t tokens = 0;
+            if (pos_max >= 0) {
+                const size_t positions_before = pos_before < 0 ? 0 : static_cast<size_t>(pos_before) + 1;
+                const size_t collapsed = tokens_before > positions_before ? tokens_before - positions_before : 0;
+                tokens = collapsed + static_cast<size_t>(pos_max) + 1;
+            }
+            if (!block_manager->reserve(seq_id, tokens)) {
                 LLAMA_LOG_ERROR("%s: failed to update paged block table for sequence %d\n", __func__, seq_id);
                 return false;
             }
@@ -524,12 +532,26 @@ bool llama_memory_hybrid_context::build_paged_metadata() {
             return false;
         }
         ++metadata.batch_lens[row];
+    }
 
-        const size_t logical_page = static_cast<size_t>(ubatch.pos[i]) / paged_pool->page_size();
+    std::vector<size_t> write_indices(metadata.n_sequences);
+    for (int32_t row = 0; row < metadata.n_sequences; ++row) {
+        const int sequence_id = ubatch.seq_id_unq[row];
+        const size_t tokens = block_manager->token_count(sequence_id);
+        if (metadata.batch_lens[row] < 0 || static_cast<size_t>(metadata.batch_lens[row]) > tokens) {
+            return false;
+        }
+        write_indices[row] = tokens - static_cast<size_t>(metadata.batch_lens[row]);
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const int32_t row = rows.at(ubatch.seq_id[i][0]);
+        const size_t write_index = write_indices[row]++;
+        const size_t logical_page = write_index / paged_pool->page_size();
         if (logical_page >= tables[row].size()) {
             return false;
         }
-        const uint32_t offset = static_cast<uint32_t>(ubatch.pos[i]) % paged_pool->page_size();
+        const uint32_t offset = static_cast<uint32_t>(write_index % paged_pool->page_size());
         for (uint32_t device = 0; device < 2; ++device) {
             metadata.write_slots[device][i] = tables[row][logical_page].physical[device] * paged_pool->page_size() + offset;
         }

@@ -2036,7 +2036,7 @@ bool server_prompt_cache::load(
     server_prompt_cache_state * best = nullptr;
 
     size_t indexed_tokens = 0;
-    const uint64_t indexed_id = index.find_longest_prefix(tokens_new.get_tokens(), fingerprint, &indexed_tokens);
+    const uint64_t indexed_id = tokens_new.has_mtmd ? 0 : index.find_longest_prefix(tokens_new.get_tokens(), fingerprint, &indexed_tokens);
     const auto indexed = states_by_id.find(indexed_id);
     if (indexed != states_by_id.end()) {
         const float f_keep_cur = 1.0f;

@@ -242,10 +242,6 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
         error = "the Qwen3.8 profile rejects CPU KV storage";
         return false;
     }
-    if (!params.mmproj.empty() || !params.image.empty()) {
-        error = "the Qwen3.8 profile does not support image or video input";
-        return false;
-    }
     if (params.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN || params.yarn_orig_ctx != 0 || params.yarn_ext_factor >= 0.0f) {
         error = "the Qwen3.8 profile rejects YaRN";
         return false;
@@ -270,7 +266,8 @@ bool server_qwen38_profile_apply(common_params & params, std::string & error) {
     params.cache_type_v = GGML_TYPE_Q8_0;
     params.ctx_shift = false;
     params.no_kv_offload = false;
-    params.no_mmproj = true;
+    params.no_mmproj = params.mmproj.empty();
+    params.mmproj_use_gpu = false;
     params.kv_unified = true;
     params.kv_paged_storage = true;
     params.cont_batching = true;

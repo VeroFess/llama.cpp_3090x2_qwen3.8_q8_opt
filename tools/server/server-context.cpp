@@ -277,7 +277,7 @@ struct server_slot {
 
         llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
         llama_paged_memory_stats paged_stats;
-        const bool paged = llama_memory_paged_get_stats(mem_tgt, &paged_stats);
+        const bool paged = !prompt.tokens.has_mtmd && llama_memory_paged_get_stats(mem_tgt, &paged_stats);
         uint64_t paged_prefix_id = 0;
         if (paged && !llama_memory_paged_prefix_pin(mem_tgt, id, prompt.tokens.size(), &paged_prefix_id)) {
             SLT_WRN(*this, "%s", "failed to pin resident prompt prefix\n");
