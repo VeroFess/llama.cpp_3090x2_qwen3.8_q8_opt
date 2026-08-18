@@ -487,19 +487,23 @@ bool server_qwen38_profile_validate_model(common_params & params, const llama_mo
     }
 
     size_t q8_matrices = 0;
-    size_t rejected_matrices = 0;
+    size_t core_matrices = 0;
+    long double core_bits = 0.0;
+    long double core_elements = 0.0;
     for (const auto & entry : model->tensors_by_name) {
         const ggml_tensor * tensor = entry.second;
         if (tensor == nullptr || ggml_n_dims(tensor) < 2 || ggml_nelements(tensor) < 1024 * 1024) {
             continue;
         }
+        ++core_matrices;
+        core_bits += (long double) ggml_nbytes(tensor) * 8.0;
+        core_elements += ggml_nelements(tensor);
         if (tensor->type == GGML_TYPE_Q8_0) {
             ++q8_matrices;
-        } else {
-            ++rejected_matrices;
         }
     }
-    if (q8_matrices == 0 || rejected_matrices != 0) {
+    const double core_bpw = core_elements > 0.0 ? (double) (core_bits / core_elements) : 0.0;
+    if (core_matrices == 0 || core_bpw < 8.5) {
         error = "the model contains a core matrix below the Q8 quality floor";
         return false;
     }
@@ -522,11 +526,11 @@ bool server_qwen38_profile_validate_model(common_params & params, const llama_mo
         LOG_INF("qwen38 profile: autotune cache validated, key_sha256=%s\n", params.autotune_cache_key_sha256.c_str());
     }
     if (tensor_mode) {
-        LOG_INF("qwen38 profile: model validated, layers=64, tensor_split=1/1, recurrent=48, attention=16, q8_matrices=%zu, mtp_layers=%u\n",
-            q8_matrices, hparams.n_layer_nextn);
+        LOG_INF("qwen38 profile: model validated, layers=64, tensor_split=1/1, recurrent=48, attention=16, core_bpw=%.2f, q8_matrices=%zu, mtp_layers=%u\n",
+            core_bpw, q8_matrices, hparams.n_layer_nextn);
     } else {
-        LOG_INF("qwen38 profile: model validated, layers=64, boundary=%d/%d, recurrent=48, attention=16, q8_matrices=%zu, mtp_layers=%u\n",
-            layer_boundary, 64 - layer_boundary, q8_matrices, hparams.n_layer_nextn);
+        LOG_INF("qwen38 profile: model validated, layers=64, boundary=%d/%d, recurrent=48, attention=16, core_bpw=%.2f, q8_matrices=%zu, mtp_layers=%u\n",
+            layer_boundary, 64 - layer_boundary, core_bpw, q8_matrices, hparams.n_layer_nextn);
     }
     LOG_INF("qwen38 profile: max_model_len=%d, max_num_seqs=%d, kv=q8_0, page_size=%d, reserve_mib=%d\n",
         QWEN38_CONTEXT, QWEN38_SEQUENCES, params.kv_page_size, params.gpu_memory_reserve_mib);
