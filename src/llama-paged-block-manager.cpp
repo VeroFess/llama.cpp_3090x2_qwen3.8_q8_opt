@@ -53,7 +53,7 @@ size_t llama_paged_block_manager::available_pages() const {
 size_t llama_paged_block_manager::committed_pages_locked() const {
     size_t result = 0;
     for (const auto & sequence : sequences) {
-        result += std::max(sequence.second.pages.size(), sequence.second.quota_pages);
+        result += sequence.second.pages.size();
     }
     return result;
 }
@@ -115,7 +115,6 @@ bool llama_paged_block_manager::can_reserve_batch_locked(const std::vector<std::
     }
 
     size_t required_pages = 0;
-    size_t additional_commitment = 0;
     size_t new_sequences = 0;
     std::unordered_set<int> seen;
     for (const auto & request : requests) {
@@ -132,7 +131,6 @@ bool llama_paged_block_manager::can_reserve_batch_locked(const std::vector<std::
 
         const size_t current_pages = it == sequences.end() ? 0 : it->second.pages.size();
         const size_t current_tokens = it == sequences.end() ? 0 : it->second.tokens;
-        const size_t quota_pages = it == sequences.end() ? 0 : it->second.quota_pages;
         const size_t requested_pages = (tokens + block_size - 1) / block_size;
         const size_t additional = requested_pages > current_pages ? requested_pages - current_pages : 0;
 
@@ -154,20 +152,9 @@ bool llama_paged_block_manager::can_reserve_batch_locked(const std::vector<std::
         }
         required_pages += needed;
 
-        const size_t old_commitment = std::max(current_pages, quota_pages);
-        const size_t new_commitment = std::max(requested_pages, quota_pages);
-        if (new_commitment > old_commitment) {
-            const size_t delta = new_commitment - old_commitment;
-            if (additional_commitment > std::numeric_limits<size_t>::max() - delta) {
-                return false;
-            }
-            additional_commitment += delta;
-        }
     }
 
-    const size_t committed = committed_pages_locked();
-    return committed <= logical_pages.size() && sequences.size() + new_sequences <= sequence_limit && required_pages <= available_pages() &&
-        additional_commitment <= logical_pages.size() - committed;
+    return sequences.size() + new_sequences <= sequence_limit && required_pages <= available_pages();
 }
 
 bool llama_paged_block_manager::can_reserve_batch(const std::vector<std::pair<int, size_t>> & requests) const {
@@ -384,11 +371,7 @@ bool llama_paged_block_manager::admit(int sequence_id, size_t max_tokens) {
     }
 
     const size_t requested_quota = (max_tokens + block_size - 1) / block_size;
-    const size_t old_commitment = std::max(it->second.pages.size(), it->second.quota_pages);
-    const size_t new_commitment = std::max(it->second.pages.size(), requested_quota);
-    const size_t committed = committed_pages_locked();
-    const size_t additional = new_commitment > old_commitment ? new_commitment - old_commitment : 0;
-    if (committed > logical_pages.size() || additional > logical_pages.size() - committed) {
+    if (requested_quota > logical_pages.size()) {
         ++failure_count;
         if (it->second.pages.empty() && it->second.quota_pages == 0) {
             sequences.erase(it);
